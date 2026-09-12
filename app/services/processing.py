@@ -16,6 +16,8 @@ from app.database import SessionLocal
 from app.intelligence.models import ProcessingResult
 from app.intelligence.service import process_audio
 from app.models import Shipment, ShipmentStatus
+from app.services.drivers import DriverAssignment, assign_driver_for_shipment
+from app.services.messaging import MetaMessagingError, MetaMessagingService
 from app.services.meta import MetaMediaError, MetaMediaService
 
 
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 SessionFactory = Callable[[], Session]
 MediaDownloader = Callable[[str, int], Path]
 IntelligenceProcessor = Callable[[int], Awaitable[ProcessingResult]]
+DriverNotifier = Callable[[int], Awaitable[None]]
 
 
 class ShipmentTaskRunner:
@@ -35,11 +38,13 @@ class ShipmentTaskRunner:
         session_factory: SessionFactory = SessionLocal,
         media_downloader: MediaDownloader | None = None,
         intelligence_processor: IntelligenceProcessor | None = None,
+        driver_notifier: DriverNotifier | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._media_downloader = media_downloader or self._download_from_meta
         self._intelligence_processor = intelligence_processor
+        self._driver_notifier = driver_notifier or self._assign_driver_and_notify
 
     async def __call__(self, shipment_id: int) -> None:
         """Download media, then process the same shipment when enabled."""
@@ -81,6 +86,71 @@ class ShipmentTaskRunner:
                 shipment_id,
                 type(exc).__name__,
             )
+            return
+
+        await self._notify_driver_if_accepted(shipment_id)
+
+    async def _notify_driver_if_accepted(self, shipment_id: int) -> None:
+        """Assign + message a driver only once intelligence actually accepted the shipment.
+
+        A failure here (no matching driver, or the outbound WhatsApp
+        send failing) is logged and swallowed rather than propagated --
+        the intelligence outcome for this shipment already succeeded
+        and must not be retroactively marked FAILED because a
+        downstream, best-effort step didn't complete.
+        """
+        with self._session_factory() as session:
+            shipment = session.get(Shipment, shipment_id)
+            accepted = shipment is not None and shipment.status is ShipmentStatus.COMPLETED
+        if not accepted:
+            return
+
+        try:
+            await self._driver_notifier(shipment_id)
+        except Exception as exc:
+            logger.error(
+                "driver_notification_failed shipment_id=%s error_type=%s",
+                shipment_id,
+                type(exc).__name__,
+            )
+
+    async def _assign_driver_and_notify(self, shipment_id: int) -> None:
+        """Default driver notifier: DB assignment, then a Meta WhatsApp send."""
+
+        assignment = await asyncio.to_thread(self._assign_driver, shipment_id)
+        if assignment is None:
+            return
+        await asyncio.to_thread(self._send_driver_message, assignment)
+
+    def _assign_driver(self, shipment_id: int) -> DriverAssignment | None:
+        with self._session_factory() as session:
+            return assign_driver_for_shipment(session, shipment_id)
+
+    def _send_driver_message(self, assignment: DriverAssignment) -> None:
+        with httpx.Client(timeout=self._settings.meta_request_timeout_seconds) as http_client:
+            service = MetaMessagingService(
+                access_token=self._settings.meta_access_token,
+                graph_api_base_url=self._settings.meta_graph_api_base_url,
+                graph_api_version=self._settings.meta_api_version,
+                phone_number_id=self._settings.meta_phone_number_id,
+                http_client=http_client,
+            )
+            try:
+                service.send_text_message(to=assignment.driver.phone, body=assignment.message)
+            except MetaMessagingError as exc:
+                logger.warning(
+                    "driver_message_send_failed driver_id=%s truck_number=%s reason=%s",
+                    assignment.driver.id,
+                    assignment.driver.truck_number,
+                    exc,
+                )
+                return
+
+        logger.info(
+            "driver_message_sent driver_id=%s driver_phone=%s",
+            assignment.driver.id,
+            assignment.driver.phone,
+        )
 
     def _download_and_persist(self, shipment_id: int) -> bool:
         with self._session_factory() as session:

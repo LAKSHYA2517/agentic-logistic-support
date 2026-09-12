@@ -20,3 +20,5 @@ class WebhookResponse(BaseModel):
     processing_queued: int = 0
     media_downloaded: int = 0
     failed: int = 0
+    driver_confirmed: int = 0
+    driver_rejected: int = 0

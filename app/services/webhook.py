@@ -14,6 +14,55 @@ class ParsedMetaMessage:
     message_type: str
 
 
+@dataclass(frozen=True)
+class ParsedTextMessage:
+    """Fields needed from an incoming WhatsApp text message (e.g. a driver's YES/NO)."""
+
+    sender_number: str
+    message_id: Optional[str]
+    text_body: str
+
+
+def extract_text_messages(payload: dict[str, Any]) -> list[ParsedTextMessage]:
+    """Extract plain-text messages while tolerating missing/unexpected fields.
+
+    Mirrors ``extract_audio_messages`` -- same envelope-walking helpers,
+    just filtered to ``type == "text"`` messages with a non-empty body.
+    """
+
+    extracted: list[ParsedTextMessage] = []
+
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                if _optional_string(message.get("type")) != "text":
+                    continue
+
+                text = message.get("text")
+                body = _optional_string(text.get("body")) if isinstance(text, dict) else None
+                if body is None:
+                    continue
+
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                extracted.append(
+                    ParsedTextMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        text_body=body,
+                    )
+                )
+
+    return extracted
+
+
 def extract_audio_messages(payload: dict[str, Any]) -> list[ParsedMetaMessage]:
     """Extract audio messages while tolerating missing or unexpected fields."""
 

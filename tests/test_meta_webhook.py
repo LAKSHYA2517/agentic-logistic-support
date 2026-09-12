@@ -15,8 +15,10 @@ from app.database import Base, get_db
 from app.intelligence.models import LogisticsExtraction, STTResult
 from app.intelligence.service import process_audio
 from app.main import app
-from app.models import Shipment, ShipmentStatus, User, UserRole
+from app.models import Driver, DriverConfirmationStatus, Shipment, ShipmentStatus, User, UserRole
 from app.routes.webhook import receive_meta_webhook
+from app.services.drivers import assign_driver_for_shipment
+from app.services.messaging import MetaMessagingService
 from app.services.meta import MetaMediaService
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
 from app.services.webhook import extract_audio_messages
@@ -181,6 +183,39 @@ def _audio_payload(
     }
 
 
+def _text_payload(
+    sender: str,
+    body: str,
+    message_id: str = "wamid.reply",
+) -> dict[str, Any]:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "business-account-id",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "contacts": [{"wa_id": sender, "profile": {"name": "Driver"}}],
+                            "messages": [
+                                {
+                                    "from": sender,
+                                    "id": message_id,
+                                    "timestamp": "1720000000",
+                                    "type": "text",
+                                    "text": {"body": body},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def test_valid_audio_webhook_is_parsed_and_persisted(
     webhook_client: tuple, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -203,6 +238,8 @@ def test_valid_audio_webhook_is_parsed_and_persisted(
         "processing_queued": 1,
         "media_downloaded": 0,
         "failed": 0,
+        "driver_confirmed": 0,
+        "driver_rejected": 0,
     }
     assert len(meta_requests) == 2
     assert "webhook_received" in caplog.text
@@ -262,6 +299,8 @@ def test_missing_optional_message_fields_are_safe(webhook_client: tuple) -> None
         "processing_queued": 0,
         "media_downloaded": 0,
         "failed": 1,
+        "driver_confirmed": 0,
+        "driver_rejected": 0,
     }
     assert meta_requests == []
 
@@ -301,6 +340,8 @@ def test_irrelevant_and_malformed_payloads_are_ignored(webhook_client: tuple) ->
             "processing_queued": 0,
             "media_downloaded": 0,
             "failed": 0,
+            "driver_confirmed": 0,
+            "driver_rejected": 0,
         }
         for response in responses
     )
@@ -329,6 +370,8 @@ def test_existing_user_is_reused(webhook_client: tuple) -> None:
         "processing_queued": 0,
         "media_downloaded": 0,
         "failed": 0,
+        "driver_confirmed": 0,
+        "driver_rejected": 0,
     }
     assert len(meta_requests) == 4
     with session_factory() as session:
@@ -353,6 +396,8 @@ def test_media_download_failure_marks_shipment_failed(
         "processing_queued": 1,
         "media_downloaded": 0,
         "failed": 0,
+        "driver_confirmed": 0,
+        "driver_rejected": 0,
     }
     assert len(meta_requests) == 1
     with session_factory() as session:
@@ -612,3 +657,471 @@ def test_meta_webhook_verification_requires_configuration(
 
     assert response.status_code == 503
     assert response.json() == {"detail": "Webhook verification is not configured."}
+
+
+# ---------------------------------------------------------------------------
+# Driver assignment and outbound WhatsApp confirmation
+# ---------------------------------------------------------------------------
+
+
+def _make_driver_notifier(session_factory, meta_send_calls: list[httpx.Request]):
+    """Real DB assignment + a real MetaMessagingService, transport mocked."""
+
+    def meta_send_handler(request: httpx.Request) -> httpx.Response:
+        meta_send_calls.append(request)
+        return httpx.Response(200, json={"messages": [{"id": "wamid.sent"}]})
+
+    async def driver_notifier(shipment_id: int) -> None:
+        with session_factory() as session:
+            assignment = assign_driver_for_shipment(session, shipment_id)
+        if assignment is None:
+            return
+        transport = httpx.MockTransport(meta_send_handler)
+        with httpx.Client(transport=transport) as client:
+            service = MetaMessagingService(
+                access_token="driver-message-token",
+                graph_api_base_url="https://graph.driver-flow.test",
+                graph_api_version="v25.0",
+                phone_number_id="driver-phone-number-id",
+                http_client=client,
+            )
+            service.send_text_message(to=assignment.driver.phone, body=assignment.message)
+
+    return driver_notifier
+
+
+def test_full_flow_seller_voice_to_driver_assignment_and_whatsapp_message(
+    webhook_client: tuple, tmp_path: Path
+) -> None:
+    client, session_factory, _ = webhook_client
+
+    with session_factory() as session:
+        driver = Driver(name="Rajesh Kumar", phone="15550009999", truck_number="RJ14GB1122")
+        session.add(driver)
+        session.commit()
+        driver_id = driver.id
+
+    def meta_media_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.driver-flow.test":
+            return httpx.Response(
+                200, json={"url": "https://media.driver-flow.test/download/voice-note"}
+            )
+        return httpx.Response(
+            200,
+            content=b"OggS driver-assignment voice note",
+            headers={"content-type": "audio/ogg"},
+        )
+
+    meta_client = httpx.Client(transport=httpx.MockTransport(meta_media_handler))
+    media_service = MetaMediaService(
+        access_token="media-token",
+        graph_api_base_url="https://graph.driver-flow.test",
+        graph_api_version="v25.0",
+        output_dir=tmp_path / "driver-flow-media",
+        max_media_bytes=1024,
+        http_client=meta_client,
+        phone_number_id="media-phone-id",
+    )
+
+    async def fake_stt(file_path: str) -> STTResult:
+        return STTResult(
+            transcript=(
+                "Ramesh Traders truck RJ14GB1122 Delhi advance das hazaar and "
+                "balance pachees hazaar"
+            ),
+            provider="fake",
+            model="fake",
+        )
+
+    async def fake_extractor(_: str) -> LogisticsExtraction:
+        return LogisticsExtraction(
+            party_name="Ramesh Traders",
+            truck_number="RJ14GB1122",
+            destination="Delhi",
+            advance_paid=10000,
+            balance_due=25000,
+        )
+
+    async def intelligence_processor(shipment_id: int):
+        return await process_audio(
+            shipment_id,
+            session_factory=session_factory,
+            stt=fake_stt,
+            extractor=fake_extractor,
+        )
+
+    meta_send_calls: list[httpx.Request] = []
+    runner = ShipmentTaskRunner(
+        settings=AppSettings(intelligence_enabled=True),
+        session_factory=session_factory,
+        media_downloader=media_service.download_audio,
+        intelligence_processor=intelligence_processor,
+        driver_notifier=_make_driver_notifier(session_factory, meta_send_calls),
+    )
+    app.dependency_overrides[get_shipment_task_runner] = lambda: runner
+
+    payload = _audio_payload(
+        sender="919876500000",
+        message_id="wamid.driver-flow",
+        media_id="media-driver-flow",
+    )
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    with session_factory() as session:
+        shipment = session.scalar(
+            select(Shipment).where(Shipment.message_id == "wamid.driver-flow")
+        )
+        assert shipment is not None
+        assert shipment.status is ShipmentStatus.COMPLETED
+        assert shipment.driver_id == driver_id
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.PENDING
+        assert shipment.driver_message_sent_at is not None
+
+    assert len(meta_send_calls) == 1
+    sent_body = json.loads(meta_send_calls[0].read())
+    assert sent_body["to"] == "15550009999"
+    assert sent_body["type"] == "text"
+    assert sent_body["text"]["body"] == (
+        "New shipment assigned. Party: Ramesh Traders, Truck: RJ14GB1122, "
+        "Destination: Delhi, Advance: ₹10,000, Balance: ₹25,000. "
+        "Please confirm YES or NO."
+    )
+
+
+def test_truck_not_found_is_graceful_no_driver_assigned_no_message_sent(
+    webhook_client: tuple, tmp_path: Path
+) -> None:
+    client, session_factory, _ = webhook_client
+    # Deliberately no driver seeded for MH12AB1234.
+
+    def meta_media_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.no-driver.test":
+            return httpx.Response(
+                200, json={"url": "https://media.no-driver.test/download/voice-note"}
+            )
+        return httpx.Response(
+            200,
+            content=b"OggS unmatched truck voice note",
+            headers={"content-type": "audio/ogg"},
+        )
+
+    meta_client = httpx.Client(transport=httpx.MockTransport(meta_media_handler))
+    media_service = MetaMediaService(
+        access_token="media-token",
+        graph_api_base_url="https://graph.no-driver.test",
+        graph_api_version="v25.0",
+        output_dir=tmp_path / "no-driver-media",
+        max_media_bytes=1024,
+        http_client=meta_client,
+        phone_number_id="media-phone-id",
+    )
+
+    async def fake_stt(file_path: str) -> STTResult:
+        return STTResult(
+            transcript="truck MH12AB1234 advance das hazaar", provider="fake", model="fake"
+        )
+
+    async def fake_extractor(_: str) -> LogisticsExtraction:
+        return LogisticsExtraction(truck_number="MH12AB1234", advance_paid=10000)
+
+    async def intelligence_processor(shipment_id: int):
+        return await process_audio(
+            shipment_id,
+            session_factory=session_factory,
+            stt=fake_stt,
+            extractor=fake_extractor,
+        )
+
+    notifier_calls = {"count": 0}
+
+    async def spy_driver_notifier(shipment_id: int) -> None:
+        notifier_calls["count"] += 1
+        with session_factory() as session:
+            assignment = assign_driver_for_shipment(session, shipment_id)
+        assert assignment is None
+
+    runner = ShipmentTaskRunner(
+        settings=AppSettings(intelligence_enabled=True),
+        session_factory=session_factory,
+        media_downloader=media_service.download_audio,
+        intelligence_processor=intelligence_processor,
+        driver_notifier=spy_driver_notifier,
+    )
+    app.dependency_overrides[get_shipment_task_runner] = lambda: runner
+
+    payload = _audio_payload(
+        sender="919876500001",
+        message_id="wamid.no-driver",
+        media_id="media-no-driver",
+    )
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    assert notifier_calls["count"] == 1
+    with session_factory() as session:
+        shipment = session.scalar(
+            select(Shipment).where(Shipment.message_id == "wamid.no-driver")
+        )
+        assert shipment is not None
+        assert shipment.status is ShipmentStatus.COMPLETED
+        assert shipment.driver_id is None
+        assert shipment.driver_confirmation_status is None
+
+
+def test_duplicate_audio_webhook_sends_driver_message_only_once(
+    webhook_client: tuple, tmp_path: Path
+) -> None:
+    client, session_factory, _ = webhook_client
+    with session_factory() as session:
+        session.add(Driver(name="Rajesh Kumar", phone="15550009999", truck_number="RJ14GB1122"))
+        session.commit()
+
+    def meta_media_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.dup-driver.test":
+            return httpx.Response(
+                200, json={"url": "https://media.dup-driver.test/download/voice-note"}
+            )
+        return httpx.Response(
+            200,
+            content=b"OggS dup driver voice note",
+            headers={"content-type": "audio/ogg"},
+        )
+
+    meta_client = httpx.Client(transport=httpx.MockTransport(meta_media_handler))
+    media_service = MetaMediaService(
+        access_token="media-token",
+        graph_api_base_url="https://graph.dup-driver.test",
+        graph_api_version="v25.0",
+        output_dir=tmp_path / "dup-driver-media",
+        max_media_bytes=1024,
+        http_client=meta_client,
+        phone_number_id="media-phone-id",
+    )
+
+    async def fake_stt(file_path: str) -> STTResult:
+        return STTResult(
+            transcript="truck RJ14GB1122 advance das hazaar", provider="fake", model="fake"
+        )
+
+    async def fake_extractor(_: str) -> LogisticsExtraction:
+        return LogisticsExtraction(truck_number="RJ14GB1122", advance_paid=10000)
+
+    async def intelligence_processor(shipment_id: int):
+        return await process_audio(
+            shipment_id,
+            session_factory=session_factory,
+            stt=fake_stt,
+            extractor=fake_extractor,
+        )
+
+    meta_send_calls: list[httpx.Request] = []
+    runner = ShipmentTaskRunner(
+        settings=AppSettings(intelligence_enabled=True),
+        session_factory=session_factory,
+        media_downloader=media_service.download_audio,
+        intelligence_processor=intelligence_processor,
+        driver_notifier=_make_driver_notifier(session_factory, meta_send_calls),
+    )
+    app.dependency_overrides[get_shipment_task_runner] = lambda: runner
+
+    payload = _audio_payload(
+        sender="919876500002",
+        message_id="wamid.dup-driver",
+        media_id="media-dup-driver",
+    )
+    first_response = client.post("/meta-webhook", json=payload)
+    duplicate_response = client.post("/meta-webhook", json=payload)
+
+    assert first_response.json()["processing_queued"] == 1
+    assert duplicate_response.json()["duplicates"] == 1
+    assert len(meta_send_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Driver YES/NO replies
+# ---------------------------------------------------------------------------
+
+
+def _seed_pending_driver_shipment(
+    session_factory,
+    *,
+    driver_phone: str = "15550009999",
+    truck: str = "RJ14GB1122",
+    seller_number: str = "919876500003",
+) -> tuple[int, int]:
+    from datetime import datetime, timezone
+
+    with session_factory() as session:
+        driver = Driver(name="Rajesh Kumar", phone=driver_phone, truck_number=truck)
+        user = User(whatsapp_number=seller_number, role=UserRole.TRANSPORTER)
+        shipment = Shipment(
+            user=user,
+            driver=driver,
+            status=ShipmentStatus.COMPLETED,
+            raw_event={"object": "whatsapp_business_account"},
+            extracted_data={
+                "party_name": "Ramesh Traders",
+                "truck_number": truck,
+                "destination": "Delhi",
+                "advance_paid": 10000,
+                "balance_due": 25000,
+            },
+            driver_confirmation_status=DriverConfirmationStatus.PENDING,
+            driver_message_sent_at=datetime.now(timezone.utc),
+        )
+        session.add(shipment)
+        session.commit()
+        return driver.id, shipment.id
+
+
+def test_driver_reply_yes_confirms_shipment(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011111", seller_number="919876500010"
+    )
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15550011111", body="YES", message_id="wamid.yes-reply"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["driver_confirmed"] == 1
+    assert response.json()["driver_rejected"] == 0
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED
+        assert shipment.driver_reply_message_id == "wamid.yes-reply"
+
+
+def test_driver_reply_confirm_lowercase_confirms_shipment(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011112", seller_number="919876500011"
+    )
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15550011112", body="confirm", message_id="wamid.confirm-reply"),
+    )
+
+    assert response.json()["driver_confirmed"] == 1
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED
+
+
+def test_driver_reply_no_rejects_shipment(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011113", seller_number="919876500012"
+    )
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15550011113", body="NO", message_id="wamid.no-reply"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["driver_confirmed"] == 0
+    assert response.json()["driver_rejected"] == 1
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.REJECTED
+        assert shipment.driver_reply_message_id == "wamid.no-reply"
+
+
+def test_driver_reply_reject_word_rejects_shipment(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011114", seller_number="919876500013"
+    )
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15550011114", body="Reject", message_id="wamid.reject-reply"),
+    )
+
+    assert response.json()["driver_rejected"] == 1
+
+
+def test_driver_reply_with_no_active_shipment_is_graceful(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    with session_factory() as session:
+        session.add(
+            Driver(name="Idle Driver", phone="15550011115", truck_number="DL05CD5678")
+        )
+        session.commit()
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15550011115", body="YES", message_id="wamid.idle-reply"),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "accepted",
+        "shipments_created": 0,
+        "duplicates": 0,
+        "processing_queued": 0,
+        "media_downloaded": 0,
+        "failed": 0,
+        "driver_confirmed": 0,
+        "driver_rejected": 0,
+    }
+
+
+def test_driver_reply_from_unknown_sender_is_graceful(webhook_client: tuple) -> None:
+    client, _session_factory, _ = webhook_client
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(sender="15559999999", body="YES", message_id="wamid.unknown-reply"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["driver_confirmed"] == 0
+    assert response.json()["driver_rejected"] == 0
+
+
+def test_driver_reply_unrecognized_text_does_not_change_status(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011116", seller_number="919876500014"
+    )
+
+    response = client.post(
+        "/meta-webhook",
+        json=_text_payload(
+            sender="15550011116", body="what time?", message_id="wamid.unrecognized-reply"
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["driver_confirmed"] == 0
+    assert response.json()["driver_rejected"] == 0
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.PENDING
+
+
+def test_duplicate_driver_reply_webhook_does_not_double_process(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_pending_driver_shipment(
+        session_factory, driver_phone="15550011117", seller_number="919876500015"
+    )
+    payload = _text_payload(sender="15550011117", body="YES", message_id="wamid.dup-yes-reply")
+
+    first = client.post("/meta-webhook", json=payload)
+    second = client.post("/meta-webhook", json=payload)
+
+    assert first.json()["driver_confirmed"] == 1
+    # The redelivered webhook finds no PENDING shipment left for this
+    # driver (it already moved to CONFIRMED), so it is gracefully
+    # ignored rather than re-processed or erroring.
+    assert second.json()["driver_confirmed"] == 0
+    assert second.json()["driver_rejected"] == 0
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED

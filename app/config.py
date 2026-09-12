@@ -111,6 +111,19 @@ class AppSettings(BaseModel):
         ),
         gt=0,
     )
+    # Demo driver phone numbers: intentionally not hardcoded anywhere,
+    # including here -- each is None (that driver is skipped at seed
+    # time) unless the environment supplies a real WhatsApp-capable
+    # number to demo with. See app.seed.seed_demo_drivers.
+    demo_driver_phone_rajesh: Optional[str] = Field(
+        default_factory=lambda: os.getenv("DEMO_DRIVER_PHONE_RAJESH") or None
+    )
+    demo_driver_phone_suresh: Optional[str] = Field(
+        default_factory=lambda: os.getenv("DEMO_DRIVER_PHONE_SURESH") or None
+    )
+    demo_driver_phone_amit: Optional[str] = Field(
+        default_factory=lambda: os.getenv("DEMO_DRIVER_PHONE_AMIT") or None
+    )
 
 
 @lru_cache

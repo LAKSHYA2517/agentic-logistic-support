@@ -12,9 +12,10 @@ from sqlalchemy.orm import Session
 from app.config import AppSettings, get_settings
 from app.database import get_db
 from app.schemas import WebhookResponse
+from app.services.driver_replies import process_driver_replies
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
 from app.services.shipments import persist_audio_messages
-from app.services.webhook import extract_audio_messages
+from app.services.webhook import extract_audio_messages, extract_text_messages
 
 
 router = APIRouter(tags=["meta-webhook"])
@@ -72,12 +73,36 @@ async def receive_meta_webhook(
         logger.warning("webhook_ignored reason=non_object_payload")
         return WebhookResponse(status="ignored")
 
-    messages = extract_audio_messages(payload)
-    if not messages:
-        logger.info("webhook_ignored reason=no_audio_messages")
+    audio_messages = extract_audio_messages(payload)
+    text_messages = extract_text_messages(payload)
+
+    if not audio_messages and not text_messages:
+        logger.info("webhook_ignored reason=no_recognized_messages")
         return WebhookResponse(status="ignored")
 
-    for message in messages:
+    driver_confirmed = 0
+    driver_rejected = 0
+    if text_messages:
+        try:
+            reply_result = process_driver_replies(db, text_messages)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error("webhook_database_error error_type=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Webhook persistence failed.",
+            ) from exc
+        driver_confirmed = reply_result.confirmed
+        driver_rejected = reply_result.rejected
+
+    if not audio_messages:
+        return WebhookResponse(
+            status="accepted",
+            driver_confirmed=driver_confirmed,
+            driver_rejected=driver_rejected,
+        )
+
+    for message in audio_messages:
         logger.info(
             "webhook_message_identified message_id=%s media_id=%s",
             message.message_id,
@@ -85,7 +110,7 @@ async def receive_meta_webhook(
         )
 
     try:
-        result = persist_audio_messages(db, payload, messages)
+        result = persist_audio_messages(db, payload, audio_messages)
     except SQLAlchemyError as exc:
         db.rollback()
         logger.error("webhook_database_error error_type=%s", type(exc).__name__)
@@ -110,4 +135,6 @@ async def receive_meta_webhook(
         duplicates=result.duplicates,
         processing_queued=result.processing_queued,
         failed=result.failed,
+        driver_confirmed=driver_confirmed,
+        driver_rejected=driver_rejected,
     )

@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import Base, upgrade_local_sqlite_schema
-from app.models import Shipment, ShipmentStatus, User, UserRole
+from app.models import Driver, Shipment, ShipmentStatus, User, UserRole
 
 
 @pytest.fixture
@@ -100,8 +100,44 @@ def test_sqlite_upgrade_adds_intelligence_columns_without_losing_rows(tmp_path: 
         "processing_error",
         "processing_started_at",
         "processing_completed_at",
+        "driver_id",
+        "driver_confirmation_status",
+        "driver_message_sent_at",
+        "driver_reply_message_id",
     } <= columns
     with old_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT COUNT(*) FROM shipments").scalar() == 1
 
     old_engine.dispose()
+
+
+def test_driver_model_and_shipment_relationship(db_session: Session) -> None:
+    driver = Driver(name="Rajesh Kumar", phone="15550001111", truck_number="RJ14GB1122")
+    user = User(whatsapp_number="15559998888", role=UserRole.TRANSPORTER)
+    shipment = Shipment(
+        user=user,
+        driver=driver,
+        raw_event={"object": "whatsapp_business_account"},
+    )
+    db_session.add(shipment)
+    db_session.commit()
+    db_session.expire_all()
+
+    stored_driver = db_session.scalar(select(Driver).where(Driver.phone == "15550001111"))
+
+    assert stored_driver is not None
+    assert stored_driver.truck_number == "RJ14GB1122"
+    assert stored_driver.shipments == [shipment]
+    assert shipment.driver == stored_driver
+
+
+def test_driver_phone_and_truck_number_must_be_unique(db_session: Session) -> None:
+    db_session.add_all(
+        [
+            Driver(name="A", phone="15550001111", truck_number="RJ14GB1122"),
+            Driver(name="B", phone="15550001111", truck_number="MH12AB1234"),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()

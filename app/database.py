@@ -62,6 +62,10 @@ def upgrade_local_sqlite_schema(db_engine: Engine) -> None:
         "processing_error": "TEXT",
         "processing_started_at": "DATETIME",
         "processing_completed_at": "DATETIME",
+        "driver_id": "INTEGER REFERENCES drivers(id)",
+        "driver_confirmation_status": "VARCHAR(16)",
+        "driver_message_sent_at": "DATETIME",
+        "driver_reply_message_id": "VARCHAR(255)",
     }
 
     with db_engine.begin() as connection:
@@ -73,6 +77,10 @@ def upgrade_local_sqlite_schema(db_engine: Engine) -> None:
         connection.exec_driver_sql(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_shipments_message_id "
             "ON shipments (message_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_shipments_driver_reply_message_id "
+            "ON shipments (driver_reply_message_id)"
         )
 
 
