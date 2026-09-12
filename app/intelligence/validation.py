@@ -25,6 +25,63 @@ from app.intelligence.models import (
 )
 from app.intelligence.vehicle import format_vehicle_number, vehicle_number_groups
 
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
+
+
+def _nfc_keys(mapping: dict) -> dict:
+    """NFC-normalize every key of a word/phrase lookup table.
+
+    A Devanagari nukta letter (e.g. ज़) can be typed/transcribed either
+    precomposed (one codepoint) or decomposed (base consonant +
+    combining nukta) -- visually identical, but a different codepoint
+    sequence, so a table entry in one form silently never matches
+    lookup text in the other. Every word/phrase table in this module
+    is normalized through this (or ``_nfc`` for tuples) so it doesn't
+    matter which form a given entry happened to be typed in.
+    """
+    return {_nfc(key): value for key, value in mapping.items()}
+
+
+def _is_word_char(char: str) -> bool:
+    """True for a letter, digit, underscore, or a combining mark.
+
+    Python's ``\\w``/``\\b`` do not treat Unicode combining marks
+    (category ``Mn``/``Mc``) as word characters. That breaks a plain
+    ``\\b...\\b`` boundary check right at the end of any Devanagari
+    word that ends in a dependent vowel sign -- which is extremely
+    common in Hindi (e.g. "दिल्ली" ends in "ी", U+0940, category
+    ``Mc``) -- because both the mark and the space/punctuation after it
+    read as non-word, so no boundary transition is ever seen there.
+    Treating marks as word-continuing fixes that without pulling in a
+    new regex dependency.
+    """
+    category = unicodedata.category(char)
+    return category[0] in ("L", "N", "M") or char == "_"
+
+
+def _contains_as_word(haystack: str, needle: str) -> bool:
+    """Whether ``needle`` occurs in ``haystack`` as a whole word.
+
+    Equivalent in intent to ``re.search(rf"\\b{re.escape(needle)}\\b",
+    haystack)``, but correct for Devanagari (and any other script using
+    combining marks) -- see ``_is_word_char``.
+    """
+    if not needle:
+        return False
+    start = 0
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+        before_ok = idx == 0 or not _is_word_char(haystack[idx - 1])
+        after = idx + len(needle)
+        after_ok = after == len(haystack) or not _is_word_char(haystack[after])
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
+
 # ---------------------------------------------------------------------------
 # Vehicle number
 # ---------------------------------------------------------------------------
@@ -62,8 +119,118 @@ def normalize_truck_number(value: str) -> str | None:
     return format_vehicle_number(*match.groups())
 
 
+# A vehicle number is frequently spoken, not written -- spelled out one
+# letter/digit at a time ("R J one four G B one one two two"), which is
+# how STT will transcribe it whether the speaker used Hindi, English, or
+# Hinglish letter/digit names. Recognizing this requires mapping each
+# spoken letter-name and digit-word to its character, then collapsing a
+# run of them back into the same compact form the compact-form regex
+# above already knows how to find -- rather than a second, parallel
+# vehicle-number grammar.
+_PHONETIC_LETTER_WORDS: dict[str, str] = {
+    "a": "A", "ए": "A", "e": "A", "ay": "A",
+    "b": "B", "बी": "B", "bee": "B", "bi": "B",
+    "c": "C", "सी": "C", "see": "C", "si": "C",
+    "d": "D", "डी": "D", "dee": "D", "di": "D",
+    "ee": "E", "ई": "E",
+    "f": "F", "एफ": "F", "ef": "F",
+    "g": "G", "जी": "G", "jee": "G", "ji": "G",
+    "h": "H", "एच": "H", "ech": "H", "aitch": "H",
+    "i": "I", "आई": "I", "aai": "I", "ai": "I",
+    "j": "J", "जे": "J", "jay": "J", "je": "J",
+    "k": "K", "के": "K", "kay": "K", "ke": "K",
+    "l": "L", "एल": "L", "el": "L",
+    "m": "M", "एम": "M", "em": "M",
+    "n": "N", "एन": "N", "en": "N",
+    "o": "O", "ओ": "O",
+    "p": "P", "पी": "P", "pee": "P", "pi": "P",
+    "q": "Q", "क्यू": "Q", "kyu": "Q", "kyoo": "Q",
+    "r": "R", "आर": "R", "aar": "R", "ar": "R",
+    "s": "S", "एस": "S", "es": "S",
+    "t": "T", "टी": "T", "tee": "T", "ti": "T",
+    "u": "U", "यू": "U", "yoo": "U", "you": "U",
+    "v": "V", "वी": "V", "vee": "V", "vi": "V",
+    "w": "W", "डब्ल्यू": "W", "dablyu": "W",
+    "x": "X", "एक्स": "X", "eks": "X", "ex": "X",
+    "y": "Y", "वाय": "Y", "why": "Y", "vai": "Y",
+    "z": "Z", "ज़ेड": "Z", "zed": "Z", "ज़ी": "Z", "zee": "Z",
+}
+_PHONETIC_LETTER_WORDS = _nfc_keys(_PHONETIC_LETTER_WORDS)
+
+_PHONETIC_DIGIT_WORDS: dict[str, str] = {
+    # English-borrowed digit words, as spoken (Hinglish and Devanagari
+    # transliteration) -- alongside the native Hindi cardinal words for
+    # 1-9 (duplicated here rather than derived from _NUMBER_WORDS below,
+    # since that table is defined later in this module) -- both are
+    # common ways to spell out a vehicle number digit by digit.
+    "zero": "0", "ज़ीरो": "0", "जीरो": "0", "शून्य": "0", "sifar": "0", "सिफ़र": "0",
+    "one": "1", "वन": "1", "ek": "1", "एक": "1",
+    "two": "2", "टू": "2", "do": "2", "दो": "2",
+    "three": "3", "थ्री": "3", "teen": "3", "तीन": "3",
+    "four": "4", "फोर": "4", "char": "4", "chaar": "4", "चार": "4",
+    "five": "5", "फाइव": "5", "paanch": "5", "panch": "5", "पांच": "5", "पाँच": "5",
+    "six": "6", "सिक्स": "6", "chhe": "6", "che": "6", "छह": "6",
+    "seven": "7", "सेवन": "7", "saat": "7", "सात": "7",
+    "eight": "8", "एट": "8", "aath": "8", "आठ": "8",
+    "nine": "9", "नाइन": "9", "nau": "9", "नौ": "9",
+}
+_PHONETIC_DIGIT_WORDS = _nfc_keys(_PHONETIC_DIGIT_WORDS)
+
+
+def _phonetic_char(token: str) -> str | None:
+    normalized = _nfc(token.strip(".,;:!?()\"'")).lower()
+    if normalized in _PHONETIC_LETTER_WORDS:
+        return _PHONETIC_LETTER_WORDS[normalized]
+    if normalized in _PHONETIC_DIGIT_WORDS:
+        return _PHONETIC_DIGIT_WORDS[normalized]
+    return None
+
+
+def _delatinize_phonetic_spelling(transcript: str) -> str:
+    """Collapse runs of spelled-out letter/digit words into compact tokens.
+
+    "आर जे वन फोर जी बी वन वन टू टू" becomes a single "RJ14GB1122" token
+    inserted in place of those ten words, so the existing compact-form
+    vehicle-number regex can find it exactly as if it had been written
+    that way. Only runs of four or more consecutive recognizable
+    letter/digit words are collapsed, so an isolated word that happens
+    to also be a letter/digit name (e.g. a stray "do"/"two") is left
+    alone rather than being swept into an unrelated match. The letter
+    run and digit run within a genuine vehicle-number mention are still
+    naturally distinguished by the compact-form regex afterwards, since
+    it requires the real Indian state-code + digit + letter + digit
+    shape -- this step only makes that shape visible in the text.
+    """
+    tokens = transcript.split()
+    collapsed: list[str] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        run: list[str] = []
+        j = i
+        while j < n:
+            char = _phonetic_char(tokens[j])
+            if char is None:
+                break
+            run.append(char)
+            j += 1
+        if len(run) >= 4:
+            collapsed.append("".join(run))
+            i = j
+        else:
+            collapsed.append(tokens[i])
+            i += 1
+    return " ".join(collapsed)
+
+
 def _truck_numbers_mentioned_in(transcript: str) -> set[str]:
-    return {format_vehicle_number(*groups) for groups in _TRUCK_SEARCH_RE.findall(transcript)}
+    found = {format_vehicle_number(*groups) for groups in _TRUCK_SEARCH_RE.findall(transcript)}
+    phonetic_variant = _delatinize_phonetic_spelling(transcript)
+    if phonetic_variant != transcript:
+        found |= {
+            format_vehicle_number(*groups)
+            for groups in _TRUCK_SEARCH_RE.findall(phonetic_variant)
+        }
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +255,54 @@ _NUMBER_WORDS: dict[str, int] = {
     "तेरह": 13, "चौदह": 14, "पंद्रह": 15, "सोलह": 16, "सत्रह": 17,
     "अठारह": 18, "उन्नीस": 19, "बीस": 20, "तीस": 30, "चालीस": 40,
     "पचास": 50, "साठ": 60, "सत्तर": 70, "अस्सी": 80, "नब्बे": 90, "सौ": 100,
+    # 21-99: standard Hindi cardinal numbers, unlike 1-19/round-tens above
+    # these are irregular compound words (not "twenty" + "five" the way
+    # English is), so each needs its own table entry rather than being
+    # derivable from the tens/units already above. Previously missing
+    # entirely, which meant any spoken amount using one of these (e.g.
+    # "pachees hazaar" / "पच्चीस हज़ार" = 25000) had no recognized number
+    # word and could never be confirmed as evidence.
+    "ikkees": 21, "इक्कीस": 21, "baais": 22, "बाईस": 22, "teis": 23, "तेईस": 23,
+    "chaubees": 24, "चौबीस": 24, "pachees": 25, "pachis": 25, "पच्चीस": 25,
+    "chhabbees": 26, "छब्बीस": 26, "sattaais": 27, "सत्ताईस": 27,
+    "atthaais": 28, "अट्ठाईस": 28, "unatees": 29, "उनतीस": 29,
+    "ikatees": 31, "इकतीस": 31, "battees": 32, "बत्तीस": 32,
+    "taintees": 33, "तैंतीस": 33, "chauntees": 34, "चौंतीस": 34,
+    "paintees": 35, "पैंतीस": 35, "chhattees": 36, "छत्तीस": 36,
+    "saintees": 37, "सैंतीस": 37, "adatees": 38, "अड़तीस": 38,
+    "unataalees": 39, "उनतालीस": 39,
+    "iktalis": 41, "इकतालीस": 41, "bayaalees": 42, "बयालीस": 42,
+    "taintalis": 43, "तैंतालीस": 43, "chavaalees": 44, "चवालीस": 44,
+    "paintalis": 45, "पैंतालीस": 45, "chhiyaalees": 46, "छियालीस": 46,
+    "saintalis": 47, "सैंतालीस": 47, "adtalis": 48, "अड़तालीस": 48,
+    "unchas": 49, "उनचास": 49,
+    "ikyaavan": 51, "इक्यावन": 51, "baavan": 52, "बावन": 52,
+    "tirepan": 53, "तिरेपन": 53, "chauvan": 54, "चौवन": 54,
+    "pachpan": 55, "पचपन": 55, "chhappan": 56, "छप्पन": 56,
+    "sattaavan": 57, "सत्तावन": 57, "atthaavan": 58, "अट्ठावन": 58,
+    "unsath": 59, "उनसठ": 59,
+    "iksath": 61, "इकसठ": 61, "baasath": 62, "बासठ": 62,
+    "tirsath": 63, "तिरसठ": 63, "chaunsath": 64, "चौंसठ": 64,
+    "painsath": 65, "पैंसठ": 65, "chhiyaasath": 66, "छियासठ": 66,
+    "sadsath": 67, "सड़सठ": 67, "adsath": 68, "अड़सठ": 68,
+    "unhattar": 69, "उनहत्तर": 69,
+    "ikhattar": 71, "इकहत्तर": 71, "bahattar": 72, "बहत्तर": 72,
+    "tihattar": 73, "तिहत्तर": 73, "chauhattar": 74, "चौहत्तर": 74,
+    "pachhattar": 75, "पचहत्तर": 75, "chhihattar": 76, "छिहत्तर": 76,
+    "sathattar": 77, "सतहत्तर": 77, "athhattar": 78, "अठहत्तर": 78,
+    "unaasee": 79, "उनासी": 79,
+    "ikyaasee": 81, "इक्यासी": 81, "bayaasee": 82, "बयासी": 82,
+    "tiraasee": 83, "तिरासी": 83, "chauraasee": 84, "चौरासी": 84,
+    "pachaasee": 85, "पचासी": 85, "chhiyaasee": 86, "छियासी": 86,
+    "sattaasee": 87, "सत्तासी": 87, "atthaasee": 88, "अट्ठासी": 88,
+    "navaasee": 89, "नवासी": 89,
+    "ikyaanave": 91, "इक्यानवे": 91, "baanave": 92, "बानवे": 92,
+    "tiraanave": 93, "तिरानवे": 93, "chauraanave": 94, "चौरानवे": 94,
+    "panchaanave": 95, "पंचानवे": 95, "chhiyaanave": 96, "छियानवे": 96,
+    "sattaanave": 97, "सत्तानवे": 97, "atthaanave": 98, "अट्ठानवे": 98,
+    "ninyaanave": 99, "निन्यानवे": 99,
 }
+_NUMBER_WORDS = _nfc_keys(_NUMBER_WORDS)
 
 _MULTIPLIER_WORDS: dict[str, int] = {
     "hazaar": 1_000, "hazar": 1_000, "hajar": 1_000,
@@ -100,16 +314,23 @@ _MULTIPLIER_WORDS: dict[str, int] = {
     "करोड़": 10_000_000,
     "सौ": 100,
 }
+_MULTIPLIER_WORDS = _nfc_keys(_MULTIPLIER_WORDS)
 
 _AMOUNT_TOKEN_RE = re.compile(r"^₹?(\d[\d,]*)([kK])?$")
 
-_HEDGE_MARKERS = (
-    "shayad", "shid", "maybe", "perhaps", "probably", "pata nahi", "patanahi",
-    "not sure", "i think", "lagta hai", "शायद", "पता नहीं",
+_HEDGE_MARKERS = tuple(
+    _nfc(m)
+    for m in (
+        "shayad", "shid", "maybe", "perhaps", "probably", "pata nahi", "patanahi",
+        "not sure", "i think", "lagta hai", "शायद", "पता नहीं",
+    )
 )
 
-_ADVANCE_KEYWORDS = ("advance", "एडवांस", "पेशगी")
-_BALANCE_KEYWORDS = ("balance", "baaki", "baki", "बाकी", "शेष", "due", "pending")
+_ADVANCE_KEYWORDS = tuple(_nfc(k) for k in ("advance", "एडवांस", "पेशगी"))
+_BALANCE_KEYWORDS = tuple(
+    _nfc(k)
+    for k in ("balance", "बैलेंस", "baaki", "baki", "बाकी", "शेष", "due", "pending")
+)
 _ALL_MONEY_KEYWORDS = _ADVANCE_KEYWORDS + _BALANCE_KEYWORDS
 _KEYWORD_ALTERNATION = "|".join(re.escape(k) for k in _ALL_MONEY_KEYWORDS)
 
@@ -117,7 +338,9 @@ _KEYWORD_ALTERNATION = "|".join(re.escape(k) for k in _ALL_MONEY_KEYWORDS)
 # (Python's `re` lookbehind must be fixed-width, and the keyword
 # alternation isn't, so the comma guards are applied programmatically
 # in `_split_clauses` rather than folded into this regex).
-_DELIMITER_RE = re.compile(r",|[.;!?]|\blekin\b|\bbut\b|\baur\b|\band\b|\n", re.IGNORECASE)
+_DELIMITER_RE = re.compile(
+    r",|[.;!?]|\blekin\b|\bbut\b|\baur\b|\band\b|और|लेकिन|\n", re.IGNORECASE
+)
 
 # A comma only counts as a clause separator when it is not:
 #   - acting as a thousands-grouping separator inside a number (e.g. the
@@ -238,10 +461,67 @@ def _validate_party_name(value: str | None, transcript: str) -> FieldValidation:
     # "Raman" (a different person) -- require the name to appear as a
     # whole word (or word sequence), not merely as a substring of a
     # longer word.
-    if needle and re.search(rf"\b{re.escape(needle)}\b", haystack):
+    if needle and _contains_as_word(haystack, needle):
         return _field(value, FieldStatus.VALID, evidence="party name appears in transcript")
 
     return _field(value, FieldStatus.INVALID, evidence="party name not found in transcript")
+
+
+# Common Indian city/place names, Devanagari <-> Latin canonical
+# spelling. Not exhaustive -- covers state capitals, major metros, and
+# major logistics-corridor cities; a place outside this set still
+# validates fine as long as the extracted value and the transcript
+# agree on script. This exists because a destination is often spoken
+# in Hindi (matching the transcript's Devanagari script) while the
+# extractor may report it transliterated into Latin script (e.g.
+# "Delhi" for a transcript that actually said "दिल्ली") -- without an
+# equivalence table, a genuinely-stated destination would be marked
+# unsupported purely because of a script mismatch, not because it
+# wasn't actually said.
+_CITY_NAME_PAIRS: tuple[tuple[str, str], ...] = (
+    ("दिल्ली", "delhi"), ("मुंबई", "mumbai"), ("बॉम्बे", "bombay"),
+    ("जयपुर", "jaipur"), ("कोलकाता", "kolkata"), ("चेन्नई", "chennai"),
+    ("बेंगलुरु", "bengaluru"), ("बैंगलोर", "bangalore"), ("हैदराबाद", "hyderabad"),
+    ("पुणे", "pune"), ("अहमदाबाद", "ahmedabad"), ("सूरत", "surat"),
+    ("लखनऊ", "lucknow"), ("कानपुर", "kanpur"), ("नागपुर", "nagpur"),
+    ("इंदौर", "indore"), ("भोपाल", "bhopal"), ("पटना", "patna"),
+    ("वडोदरा", "vadodara"), ("लुधियाना", "ludhiana"), ("आगरा", "agra"),
+    ("नासिक", "nashik"), ("फरीदाबाद", "faridabad"), ("मेरठ", "meerut"),
+    ("राजकोट", "rajkot"), ("वाराणसी", "varanasi"), ("श्रीनगर", "srinagar"),
+    ("अमृतसर", "amritsar"), ("इलाहाबाद", "allahabad"), ("प्रयागराज", "prayagraj"),
+    ("रांची", "ranchi"), ("जोधपुर", "jodhpur"), ("कोयंबटूर", "coimbatore"),
+    ("गुवाहाटी", "guwahati"), ("चंडीगढ़", "chandigarh"), ("गुरुग्राम", "gurugram"),
+    ("गुड़गांव", "gurgaon"), ("नोएडा", "noida"), ("भुवनेश्वर", "bhubaneswar"),
+    ("देहरादून", "dehradun"), ("रायपुर", "raipur"), ("जालंधर", "jalandhar"),
+    ("कोटा", "kota"), ("तिरुवनंतपुरम", "thiruvananthapuram"), ("विजयवाड़ा", "vijayawada"),
+    ("विशाखापत्तनम", "visakhapatnam"), ("मैसूर", "mysuru"), ("मदुरै", "madurai"),
+    ("जमशेदपुर", "jamshedpur"), ("ग्वालियर", "gwalior"), ("औरंगाबाद", "aurangabad"),
+    ("सेलम", "salem"), ("वारंगल", "warangal"), ("तिरुचिरापल्ली", "tiruchirappalli"),
+)
+_CITY_EQUIVALENTS: dict[str, str] = {}
+for _devanagari, _latin in _CITY_NAME_PAIRS:
+    _devanagari, _latin = _nfc(_devanagari), _nfc(_latin)
+    _CITY_EQUIVALENTS[_devanagari] = _latin
+    _CITY_EQUIVALENTS[_latin] = _devanagari
+
+
+def _validate_destination(value: str | None, transcript: str) -> FieldValidation:
+    if value is None:
+        return _field(None, FieldStatus.NOT_STATED, evidence=None)
+
+    needle = unicodedata.normalize("NFC", value).strip().lower()
+    haystack = unicodedata.normalize("NFC", transcript).lower()
+
+    candidates = {needle}
+    equivalent = _CITY_EQUIVALENTS.get(needle)
+    if equivalent:
+        candidates.add(equivalent)
+
+    for candidate in candidates:
+        if candidate and _contains_as_word(haystack, candidate):
+            return _field(value, FieldStatus.VALID, evidence="destination appears in transcript")
+
+    return _field(value, FieldStatus.INVALID, evidence="destination not found in transcript")
 
 
 def _validate_truck_number(value: str | None, transcript: str) -> FieldValidation:
@@ -337,12 +617,25 @@ def validate_extraction(extraction: LogisticsExtraction, transcript: str) -> Val
     domain constraints (non-negative money), and -- critically --
     whether the transcript actually supports each non-null value.
     """
+    # Normalize once, up front: a Devanagari nukta letter (e.g. ज़) can
+    # arrive either precomposed (one codepoint) or decomposed (base
+    # consonant + combining nukta, two codepoints) -- visually and
+    # semantically identical, but a different codepoint sequence, so a
+    # transcript in one form would silently fail to match a number/
+    # keyword table entry written in the other form. NFC canonicalizes
+    # both to the same sequence. ``normalize_transcript`` (Phase 2C)
+    # already does this before validation runs in the real pipeline,
+    # but validate_extraction is also called directly (including by
+    # tests), so it must not depend on that having already happened.
+    transcript = unicodedata.normalize("NFC", transcript)
+
     party_name = _validate_party_name(extraction.party_name, transcript)
     truck_number = _validate_truck_number(extraction.truck_number, transcript)
+    destination = _validate_destination(extraction.destination, transcript)
     advance_paid = _validate_money_field(extraction.advance_paid, transcript, _ADVANCE_KEYWORDS)
     balance_due = _validate_money_field(extraction.balance_due, transcript, _BALANCE_KEYWORDS)
 
-    fields = (party_name, truck_number, advance_paid, balance_due)
+    fields = (party_name, truck_number, destination, advance_paid, balance_due)
     issues = [f.evidence for f in fields if not f.valid and f.evidence]
 
     all_valid = all(f.valid for f in fields)
@@ -367,6 +660,7 @@ def validate_extraction(extraction: LogisticsExtraction, transcript: str) -> Val
     validated_extraction = LogisticsExtraction(
         party_name=party_name.value,
         truck_number=truck_number.normalized_value or truck_number.value,
+        destination=destination.value,
         advance_paid=advance_paid.value,
         balance_due=balance_due.value,
     )
@@ -376,6 +670,7 @@ def validate_extraction(extraction: LogisticsExtraction, transcript: str) -> Val
         extraction=validated_extraction,
         party_name=party_name,
         truck_number=truck_number,
+        destination=destination,
         advance_paid=advance_paid,
         balance_due=balance_due,
         issues=issues,

@@ -326,8 +326,205 @@ def test_all_fields_null_is_needs_review_not_accepted():
         for f in (
             result.party_name,
             result.truck_number,
+            result.destination,
             result.advance_paid,
             result.balance_due,
         )
     )
     assert any("no logistics information was extracted" in issue for issue in result.issues)
+
+
+# ---------------------------------------------------------------------------
+# Destination
+# ---------------------------------------------------------------------------
+
+
+def test_destination_present_and_matching_is_valid():
+    result = validate_extraction(
+        extraction(destination="Jaipur"),
+        "gaadi Jaipur bhejni hai",
+    )
+
+    assert result.destination.status == FieldStatus.VALID
+
+
+def test_destination_absent_is_not_stated():
+    result = validate_extraction(extraction(destination=None), "truck bhej diya")
+
+    assert result.destination.status == FieldStatus.NOT_STATED
+    assert result.destination.valid is True
+
+
+def test_destination_fabricated_is_invalid():
+    result = validate_extraction(
+        extraction(destination="Mumbai"),
+        "truck jaa raha hai Pune",
+    )
+
+    assert result.destination.status == FieldStatus.INVALID
+    assert "not found" in result.destination.evidence
+
+
+def test_destination_cross_script_devanagari_transcript_latin_extraction_is_valid():
+    # Regression test: the LLM may report a well-known city in Latin
+    # script (e.g. "Delhi") even when the transcript said it in Hindi
+    # ("दिल्ली") -- a plain same-script substring check would wrongly
+    # mark this unsupported purely due to the script difference.
+    result = validate_extraction(
+        extraction(destination="Delhi"),
+        "truck दिल्ली bhejna hai",
+    )
+
+    assert result.destination.status == FieldStatus.VALID
+
+
+def test_destination_devanagari_word_ending_in_vowel_sign_matches_as_whole_word():
+    # Regression test: Python's regex \b treats a Devanagari dependent
+    # vowel sign (e.g. the "ी" ending "दिल्ली") as a non-word character,
+    # which silently broke the word-boundary check right after any
+    # Hindi word ending in one -- an extremely common word shape.
+    result = validate_extraction(
+        extraction(destination="दिल्ली"),
+        "truck दिल्ली bhejna hai",
+    )
+
+    assert result.destination.status == FieldStatus.VALID
+
+
+# ---------------------------------------------------------------------------
+# Hindi phonetic (spelled-out) vehicle numbers
+# ---------------------------------------------------------------------------
+
+
+def test_hindi_phonetic_spelled_out_vehicle_number_matches():
+    result = validate_extraction(
+        extraction(truck_number="RJ14GB1122"),
+        "truck आर जे वन फोर "
+        "जी बी वन वन टू टू bhejna hai",
+    )
+
+    assert result.truck_number.status == FieldStatus.VALID
+    assert result.truck_number.normalized_value == "RJ14GB1122"
+
+
+def test_hinglish_phonetic_spelled_out_vehicle_number_matches():
+    result = validate_extraction(
+        extraction(truck_number="MH12AB1234"),
+        "gaadi em aitch one two e bee one two three four ja rahi hai",
+    )
+
+    assert result.truck_number.status == FieldStatus.VALID
+    assert result.truck_number.normalized_value == "MH12AB1234"
+
+
+def test_isolated_phonetic_looking_word_does_not_falsely_form_a_vehicle_number():
+    # "do" (Hindi for "two") appearing on its own, not as part of a
+    # genuine spelled-out sequence, must not be swept into a false match.
+    result = validate_extraction(
+        extraction(truck_number="RJ14GB1122"),
+        "usko do baar bola advance dena hai",
+    )
+
+    assert result.truck_number.status == FieldStatus.INVALID
+
+
+# ---------------------------------------------------------------------------
+# Full Hindi cardinal number table (1-99)
+# ---------------------------------------------------------------------------
+
+
+def test_hindi_compound_number_pachees_25():
+    result = validate_extraction(
+        extraction(balance_due=25000),
+        "बैलेंस पच्चीस हज़ार रुपये है",
+    )
+
+    assert result.balance_due.status == FieldStatus.VALID
+
+
+def test_hindi_compound_numbers_across_ranges():
+    cases = (
+        (21000, "advance इक्कीस हजार diya"),
+        (47000, "advance सैंतालीस हजार diya"),
+        (63000, "advance तिरसठ हजार diya"),
+        (89000, "advance नवासी हजार diya"),
+        (99000, "advance निन्यानवे हजार diya"),
+    )
+    for amount, transcript in cases:
+        result = validate_extraction(extraction(advance_paid=amount), transcript)
+        assert result.advance_paid.status == FieldStatus.VALID, (amount, transcript)
+
+
+# ---------------------------------------------------------------------------
+# Advance/balance context isolation (Devanagari "aur"/"balance")
+# ---------------------------------------------------------------------------
+
+
+def test_devanagari_balance_keyword_and_aur_separator_isolate_each_field():
+    # Regression test: "बैलेंस" (Devanagari
+    # spelling of "balance") was not recognized as a balance keyword at
+    # all, and "और" (Devanagari "and") was not a clause
+    # delimiter -- together this meant an advance+balance sentence
+    # joined by "aur" was treated as one undivided clause, so both
+    # amounts became candidates for *both* fields.
+    transcript = (
+        "advance दस हजार रुपये है "
+        "और बैलेंस पच्चीस "
+        "हजार रुपये है"
+    )
+    result = validate_extraction(
+        extraction(advance_paid=10000, balance_due=25000), transcript
+    )
+
+    assert result.advance_paid.status == FieldStatus.VALID
+    assert result.balance_due.status == FieldStatus.VALID
+
+
+# ---------------------------------------------------------------------------
+# Genuine conflicts must still be caught
+# ---------------------------------------------------------------------------
+
+
+def test_genuinely_conflicting_amounts_still_needs_review_with_destination_present():
+    result = validate_extraction(
+        extraction(destination="Jaipur", advance_paid=5000),
+        "truck Jaipur ja raha hai, advance 5000 diya, advance bhi 8000 hua tha",
+    )
+
+    assert result.destination.status == FieldStatus.VALID
+    assert result.advance_paid.status == FieldStatus.NEEDS_REVIEW
+    assert result.status == ValidationStatus.NEEDS_REVIEW
+
+
+# ---------------------------------------------------------------------------
+# End-to-end example from the product spec
+# ---------------------------------------------------------------------------
+
+
+def test_full_hindi_voice_note_example_is_accepted():
+    transcript = (
+        "रमेश ट्रेडर्स के लिए ट्रक "
+        "आर जे वन फोर जी बी वन वन टू टू "
+        "में दिल्ली भेजना है "
+        "एडवांस दस हज़ार रुपये है "
+        "और बैलेंस पच्चीस हज़ार "
+        "रुपये है"
+    )
+    result = validate_extraction(
+        extraction(
+            party_name="रमेश ट्रेडर्स",
+            truck_number="RJ14GB1122",
+            destination="Delhi",
+            advance_paid=10000,
+            balance_due=25000,
+        ),
+        transcript,
+    )
+
+    assert result.status == ValidationStatus.ACCEPTED
+    assert result.party_name.status == FieldStatus.VALID
+    assert result.truck_number.status == FieldStatus.VALID
+    assert result.truck_number.normalized_value == "RJ14GB1122"
+    assert result.destination.status == FieldStatus.VALID
+    assert result.advance_paid.status == FieldStatus.VALID
+    assert result.balance_due.status == FieldStatus.VALID

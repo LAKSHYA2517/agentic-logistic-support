@@ -121,6 +121,7 @@ def test_needs_review_when_mixed_valid_and_invalid_fields():
             evidence="vehicle number not found in transcript",
             normalized_value="RJ14GB1122",
         ),
+        destination=not_stated(),
         advance_paid=not_stated(),
         balance_due=not_stated(),
         issues=["vehicle number not found in transcript"],
@@ -140,6 +141,7 @@ def test_needs_review_when_ambiguous_field_present_even_with_no_invalid_fields()
         extraction=LogisticsExtraction(party_name="Ramesh", advance_paid=10000),
         party_name=field("Ramesh", FieldStatus.VALID, evidence="found"),
         truck_number=not_stated(),
+        destination=not_stated(),
         advance_paid=field(
             10000, FieldStatus.NEEDS_REVIEW, evidence="transcript expresses uncertainty"
         ),
@@ -183,6 +185,7 @@ def test_failed_when_every_stated_field_is_invalid():
             evidence="vehicle number not found in transcript",
             normalized_value="RJ14GB1122",
         ),
+        destination=not_stated(),
         advance_paid=not_stated(),
         balance_due=not_stated(),
         issues=["not found in transcript", "vehicle number not found in transcript"],

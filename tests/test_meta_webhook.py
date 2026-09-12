@@ -464,6 +464,7 @@ def test_webhook_background_flow_updates_same_shipment(
         assert shipment.extracted_data == {
             "party_name": "Ramesh",
             "truck_number": "RJ14GB1122",
+            "destination": None,
             "advance_paid": 10000,
             "balance_due": None,
         }

@@ -53,6 +53,7 @@ def decide_processing_result(validation_result: ValidationResult) -> ProcessingD
     fields = (
         validation_result.party_name,
         validation_result.truck_number,
+        validation_result.destination,
         validation_result.advance_paid,
         validation_result.balance_due,
     )

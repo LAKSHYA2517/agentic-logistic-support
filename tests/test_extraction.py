@@ -361,6 +361,7 @@ async def test_request_uses_strict_json_schema_and_bearer_auth():
     assert set(schema["properties"]) == {
         "party_name",
         "truck_number",
+        "destination",
         "advance_paid",
         "balance_due",
     }

@@ -52,10 +52,11 @@ _JSON_SCHEMA = {
     "properties": {
         "party_name": {"type": ["string", "null"]},
         "truck_number": {"type": ["string", "null"]},
+        "destination": {"type": ["string", "null"]},
         "advance_paid": {"type": ["integer", "null"]},
         "balance_due": {"type": ["integer", "null"]},
     },
-    "required": ["party_name", "truck_number", "advance_paid", "balance_due"],
+    "required": ["party_name", "truck_number", "destination", "advance_paid", "balance_due"],
     "additionalProperties": False,
 }
 
@@ -65,11 +66,16 @@ You extract logistics fields from a trucking-business voice-note transcript.
 The transcript may be in Hindi, English, Hinglish, or code-mixed logistics
 terminology (e.g. "bhada", "advance", "balance", "munshi", "gaadi").
 
-Return ONLY the four fields defined by the schema:
+Return ONLY the five fields defined by the schema:
 - party_name: the name of the party/customer mentioned, if any.
 - truck_number: the vehicle registration number mentioned, if any. Report
   it in compact canonical form (uppercase letters and digits only, no
   spaces or hyphens), preserving exactly the characters that were stated.
+  If the number was spelled out (letter by letter, digit by digit -- in
+  Hindi, English, or Hinglish), convert it to the same compact canonical
+  form rather than transcribing the spoken words.
+- destination: the delivery destination (city/place) mentioned, if any,
+  in the form it was stated.
 - advance_paid: an amount paid in advance, as an integer, if explicitly
   stated.
 - balance_due: an amount still owed/pending, as an integer, if explicitly
@@ -86,9 +92,11 @@ Strict rules:
 4. Only convert spoken amounts to integers when the amount is unambiguous
    (e.g. "das hazaar" -> 10000, "10k" -> 10000, "₹10,000" -> 10000). If the
    amount is unclear or not stated, return null.
-5. Do not add any fields beyond the four defined in the schema.
+5. Do not add any fields beyond the five defined in the schema.
 6. Do not perform any calculation, aggregation, or correction beyond
    reading what was explicitly said.
+7. Never guess a destination from context (e.g. the party's home city);
+   only return one that was explicitly spoken.
 """
 
 

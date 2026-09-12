@@ -61,6 +61,7 @@ class LogisticsExtraction(BaseModel):
 
     party_name: str | None = None
     truck_number: str | None = None
+    destination: str | None = None
     advance_paid: int | None = None
     balance_due: int | None = None
 
@@ -144,6 +145,7 @@ class ValidationResult(BaseModel):
     extraction: LogisticsExtraction
     party_name: FieldValidation
     truck_number: FieldValidation
+    destination: FieldValidation
     advance_paid: FieldValidation
     balance_due: FieldValidation
     issues: list[str] = Field(default_factory=list)
