@@ -13,6 +13,16 @@ class MetaMediaError(RuntimeError):
     """A safe-to-store description of a Meta media retrieval failure."""
 
 
+# Content types a driver's POD (proof of delivery) photo/PDF can arrive
+# as, mapped to the file extension Sarvam Vision expects
+# (app.intelligence.ocr.SarvamVisionProvider.SUPPORTED_MEDIA_TYPES).
+_POD_EXTENSIONS_BY_CONTENT_TYPE = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "application/pdf": ".pdf",
+}
+
+
 class MetaMediaService:
     """Resolve and download media with an injected HTTP client."""
 
@@ -43,6 +53,22 @@ class MetaMediaService:
 
         media_url = self._resolve_media_url(media_id)
         return self._download_media(media_url, shipment_id)
+
+    def download_pod_document(self, media_id: str, shipment_id: int) -> Path:
+        """Resolve a Meta media ID and save a driver's POD photo/PDF.
+
+        A separate method from ``download_audio`` (rather than
+        generalizing it) so the seller voice-note path -- already
+        relied on and tested -- is never touched. Reuses
+        ``_resolve_media_url``, the one piece that's genuinely
+        identical between the two.
+        """
+
+        if not self._access_token:
+            raise MetaMediaError("META_ACCESS_TOKEN is not configured.")
+
+        media_url = self._resolve_media_url(media_id)
+        return self._download_pod_media(media_url, shipment_id)
 
     def _resolve_media_url(self, media_id: str) -> str:
         lookup_url = f"{self._base_url}/{self._version}/{quote(media_id, safe='')}"
@@ -110,6 +136,61 @@ class MetaMediaService:
             if bytes(ogg_header) != b"OggS":
                 raise MetaMediaError("Meta media download was not a valid Ogg file.")
 
+            partial_path.replace(final_path)
+        except MetaMediaError:
+            partial_path.unlink(missing_ok=True)
+            raise
+        except (httpx.RequestError, OSError) as exc:
+            partial_path.unlink(missing_ok=True)
+            raise MetaMediaError("Meta media download could not be saved.") from exc
+
+        return final_path
+
+    def _download_pod_media(self, media_url: str, shipment_id: int) -> Path:
+        """Stream a POD document to disk, validated by content type rather than magic bytes.
+
+        Same shape as ``_download_media`` (stream -> validate -> size-limit
+        -> finalize/cleanup), but the extension is only known once the
+        response headers arrive, so the temp file is named without one
+        until the final rename.
+        """
+
+        temp_name = f"pod-{shipment_id}-{uuid4().hex}"
+        partial_path = self._output_dir / f"{temp_name}.part"
+
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            bytes_written = 0
+            with self._client.stream(
+                "GET",
+                media_url,
+                headers=self._authorization_header,
+            ) as response:
+                if not response.is_success:
+                    raise self._http_error("download", response)
+                content_type = (
+                    response.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
+                )
+                extension = _POD_EXTENSIONS_BY_CONTENT_TYPE.get(content_type)
+                if extension is None:
+                    raise MetaMediaError(
+                        "Meta POD download had an unsupported content type: "
+                        f"{content_type or 'unknown'}."
+                    )
+
+                with partial_path.open("xb") as media_file:
+                    for chunk in response.iter_bytes():
+                        media_file.write(chunk)
+                        bytes_written += len(chunk)
+                        if bytes_written > self._max_media_bytes:
+                            raise MetaMediaError(
+                                "Meta media download exceeded the configured size limit."
+                            )
+
+            if bytes_written == 0:
+                raise MetaMediaError("Meta media download returned an empty file.")
+
+            final_path = self._output_dir / f"{temp_name}{extension}"
             partial_path.replace(final_path)
         except MetaMediaError:
             partial_path.unlink(missing_ok=True)

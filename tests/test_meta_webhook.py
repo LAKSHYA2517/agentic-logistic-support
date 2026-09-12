@@ -17,9 +17,11 @@ from app.intelligence.service import process_audio
 from app.main import app
 from app.models import Driver, DriverConfirmationStatus, Shipment, ShipmentStatus, User, UserRole
 from app.routes.webhook import receive_meta_webhook
+from app.intelligence.models import OCRResult
 from app.services.drivers import assign_driver_for_shipment
 from app.services.messaging import MetaMessagingService
 from app.services.meta import MetaMediaService
+from app.services.pod_processing import PODTaskRunner, get_pod_task_runner
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
 from app.services.webhook import extract_audio_messages, extract_message_statuses
 
@@ -240,6 +242,7 @@ def test_valid_audio_webhook_is_parsed_and_persisted(
         "failed": 0,
         "driver_confirmed": 0,
         "driver_rejected": 0,
+        "pod_processed": 0,
     }
     assert len(meta_requests) == 2
     assert "webhook_received" in caplog.text
@@ -301,6 +304,7 @@ def test_missing_optional_message_fields_are_safe(webhook_client: tuple) -> None
         "failed": 1,
         "driver_confirmed": 0,
         "driver_rejected": 0,
+        "pod_processed": 0,
     }
     assert meta_requests == []
 
@@ -342,6 +346,7 @@ def test_irrelevant_and_malformed_payloads_are_ignored(webhook_client: tuple) ->
             "failed": 0,
             "driver_confirmed": 0,
             "driver_rejected": 0,
+            "pod_processed": 0,
         }
         for response in responses
     )
@@ -429,6 +434,7 @@ def test_existing_user_is_reused(webhook_client: tuple) -> None:
         "failed": 0,
         "driver_confirmed": 0,
         "driver_rejected": 0,
+        "pod_processed": 0,
     }
     assert len(meta_requests) == 4
     with session_factory() as session:
@@ -455,6 +461,7 @@ def test_media_download_failure_marks_shipment_failed(
         "failed": 0,
         "driver_confirmed": 0,
         "driver_rejected": 0,
+        "pod_processed": 0,
     }
     assert len(meta_requests) == 1
     with session_factory() as session:
@@ -1126,6 +1133,7 @@ def test_driver_reply_with_no_active_shipment_is_graceful(webhook_client: tuple)
         "failed": 0,
         "driver_confirmed": 0,
         "driver_rejected": 0,
+        "pod_processed": 0,
     }
 
 
@@ -1182,3 +1190,220 @@ def test_duplicate_driver_reply_webhook_does_not_double_process(webhook_client: 
     with session_factory() as session:
         shipment = session.get(Shipment, shipment_id)
         assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED
+
+
+# ---------------------------------------------------------------------------
+# POD (proof of delivery)
+# ---------------------------------------------------------------------------
+
+
+def _pod_payload(
+    sender: str,
+    message_id: str,
+    media_id: str,
+    message_type: str = "image",
+) -> dict[str, Any]:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "business-account-id",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "contacts": [{"wa_id": sender}],
+                            "messages": [
+                                {
+                                    "from": sender,
+                                    "id": message_id,
+                                    "timestamp": "1720000000",
+                                    "type": message_type,
+                                    message_type: {
+                                        "id": media_id,
+                                        "mime_type": "image/jpeg",
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _seed_in_transit_shipment(
+    session_factory,
+    *,
+    driver_phone: str,
+    truck: str = "RJ14GB1122",
+    destination: str = "Delhi",
+    seller_number: str = "919876500020",
+) -> tuple[int, int]:
+    with session_factory() as session:
+        driver = Driver(name="Rajesh Kumar", phone=driver_phone, truck_number=truck)
+        user = User(whatsapp_number=seller_number, role=UserRole.TRANSPORTER)
+        shipment = Shipment(
+            user=user,
+            driver=driver,
+            status=ShipmentStatus.COMPLETED,
+            raw_event={"object": "whatsapp_business_account"},
+            extracted_data={
+                "party_name": "Ramesh Traders",
+                "truck_number": truck,
+                "destination": destination,
+                "advance_paid": 10000,
+                "balance_due": 25000,
+            },
+            driver_confirmation_status=DriverConfirmationStatus.CONFIRMED,
+        )
+        session.add(shipment)
+        session.commit()
+        return driver.id, shipment.id
+
+
+def _fake_pod_task_runner(
+    session_factory,
+    ocr_result: OCRResult,
+    extractor_calls: list[str] | None = None,
+) -> PODTaskRunner:
+    """A PODTaskRunner with both slow-I/O steps faked out.
+
+    Reuses the real PODTaskRunner (and therefore the real
+    verify_pod/status-update logic) -- only the Meta download and the
+    Sarvam Vision call are replaced, matching how Meta API calls are
+    already mocked elsewhere in this file.
+    """
+
+    def fake_media_downloader(media_id: str, shipment_id: int) -> Path:
+        return Path(f"/tmp/fake-pod-{shipment_id}.jpg")
+
+    async def fake_document_extractor(file_path: str) -> OCRResult:
+        if extractor_calls is not None:
+            extractor_calls.append(file_path)
+        return ocr_result
+
+    return PODTaskRunner(
+        settings=AppSettings(),
+        session_factory=session_factory,
+        media_downloader=fake_media_downloader,
+        document_extractor=fake_document_extractor,
+    )
+
+
+def test_pod_flow_valid_pod_marks_shipment_delivered(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_in_transit_shipment(
+        session_factory, driver_phone="919317708038"
+    )
+
+    ocr_result = OCRResult(
+        text="Proof of Delivery. Vehicle RJ14GB1122. Delivered at Delhi. Signed.",
+        provider="sarvam_vision",
+        success=True,
+        metadata={"quality": "GOOD"},
+    )
+    app.dependency_overrides[get_pod_task_runner] = lambda: _fake_pod_task_runner(
+        session_factory, ocr_result
+    )
+
+    payload = _pod_payload(
+        sender="919317708038", message_id="wamid.pod-valid", media_id="media-pod-valid"
+    )
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["pod_processed"] == 1
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.status is ShipmentStatus.DELIVERED
+        assert shipment.processing_error is None
+
+
+def test_pod_flow_wrong_truck_number_needs_review(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_in_transit_shipment(
+        session_factory, driver_phone="919317708039"
+    )
+
+    ocr_result = OCRResult(
+        text="Proof of Delivery. Vehicle MH12AB1234. Delivered at Delhi.",
+        provider="sarvam_vision",
+        success=True,
+        metadata={"quality": "GOOD"},
+    )
+    app.dependency_overrides[get_pod_task_runner] = lambda: _fake_pod_task_runner(
+        session_factory, ocr_result
+    )
+
+    payload = _pod_payload(
+        sender="919317708039", message_id="wamid.pod-wrong-truck", media_id="media-pod-wrong"
+    )
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.status is ShipmentStatus.PARSED
+        assert "MH12AB1234" in (shipment.processing_error or "")
+
+
+def test_pod_flow_conflicting_destination_needs_review(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_in_transit_shipment(
+        session_factory, driver_phone="919317708040", destination="Delhi"
+    )
+
+    ocr_result = OCRResult(
+        text="Proof of Delivery. Vehicle RJ14GB1122. Delivered at Mumbai.",
+        provider="sarvam_vision",
+        success=True,
+        metadata={"quality": "GOOD"},
+    )
+    app.dependency_overrides[get_pod_task_runner] = lambda: _fake_pod_task_runner(
+        session_factory, ocr_result
+    )
+
+    payload = _pod_payload(
+        sender="919317708040", message_id="wamid.pod-wrong-dest", media_id="media-pod-dest"
+    )
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.status is ShipmentStatus.PARSED
+        assert "mumbai" in (shipment.processing_error or "").lower()
+
+
+def test_pod_flow_duplicate_pod_processed_once(webhook_client: tuple) -> None:
+    client, session_factory, _ = webhook_client
+    _driver_id, shipment_id = _seed_in_transit_shipment(
+        session_factory, driver_phone="919317708041"
+    )
+
+    ocr_result = OCRResult(
+        text="Proof of Delivery. Vehicle RJ14GB1122. Delivered at Delhi.",
+        provider="sarvam_vision",
+        success=True,
+        metadata={"quality": "GOOD"},
+    )
+    extractor_calls: list[str] = []
+    app.dependency_overrides[get_pod_task_runner] = lambda: _fake_pod_task_runner(
+        session_factory, ocr_result, extractor_calls
+    )
+
+    payload = _pod_payload(
+        sender="919317708041", message_id="wamid.pod-dup", media_id="media-pod-dup"
+    )
+    first = client.post("/meta-webhook", json=payload)
+    second = client.post("/meta-webhook", json=payload)
+
+    assert first.json()["pod_processed"] == 1
+    assert second.json()["pod_processed"] == 0
+    assert len(extractor_calls) == 1
+    with session_factory() as session:
+        shipment = session.get(Shipment, shipment_id)
+        assert shipment.status is ShipmentStatus.DELIVERED

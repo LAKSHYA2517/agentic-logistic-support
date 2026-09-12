@@ -28,6 +28,7 @@ class ShipmentStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
+    DELIVERED = "DELIVERED"
     FAILED = "FAILED"
 
 

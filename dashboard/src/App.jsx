@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { Dashboard } from './components/Dashboard';
 import { INITIAL_MOCK_SHIPMENTS } from './utils/constants';
@@ -136,20 +136,16 @@ function App() {
     triggerHighlight(normalizedShipment.id);
   }, [triggerHighlight]);
 
-  // Mirrors `shipments` so the poller below can compare against current
-  // state without depending on (and re-subscribing on) `shipments` itself.
-  const shipmentsRef = useRef(shipments);
-  useEffect(() => {
-    shipmentsRef.current = shipments;
-  }, [shipments]);
-
-  // Poll the real backend for shipment state. Only shipments that are
-  // new or actually changed are pushed through handleIncomingPayload --
-  // this both reuses its existing upsert/highlight logic as-is and
-  // avoids flashing every row on every poll tick when nothing changed.
-  // Locally-simulated demo shipments (from the Voice Simulator) are
-  // never touched here, since this only ever upserts backend-known
-  // ids, never replaces the whole list.
+  // Poll the real backend for shipment state. The backend response is
+  // the source of truth for every shipment it knows about: this
+  // replaces the shipment list with exactly what it returns each
+  // cycle, so a shipment cleared from the database (or otherwise no
+  // longer returned) disappears from the dashboard too, instead of
+  // lingering forever in local state / localStorage. Only rows that
+  // actually changed get the highlight flash, and locally-simulated
+  // demo shipments (Voice Simulator) are expected to be transient now
+  // that a real backend is the source of truth -- they survive until
+  // the next poll tick.
   const fetchShipmentsFromBackend = useCallback(async () => {
     let response;
     try {
@@ -167,23 +163,35 @@ function App() {
     }
     if (!Array.isArray(backendShipments)) return;
 
-    for (const raw of backendShipments) {
-      if (!raw || !raw.id) continue;
-      const previous = shipmentsRef.current.find((s) => s.id === raw.id);
-      const changed =
-        !previous ||
-        previous.status !== raw.status ||
-        previous.party_name !== raw.party_name ||
-        previous.truck_number !== raw.truck_number ||
-        previous.destination !== raw.destination ||
-        Number(previous.advance_paid) !== Number(raw.advance_paid) ||
-        Number(previous.balance_due) !== Number(raw.balance_due);
+    const normalized = backendShipments
+      .filter((raw) => raw && raw.id)
+      .map((raw) => ({
+        ...raw,
+        advance_paid: Number(raw.advance_paid) || 0,
+        balance_due: Number(raw.balance_due) || 0,
+        updated_at: raw.updated_at || new Date().toISOString(),
+      }));
 
-      if (changed) {
-        handleIncomingPayload(raw);
+    const changedIds = [];
+    setShipments((prevShipments) => {
+      const previousById = new Map(prevShipments.map((s) => [s.id, s]));
+      for (const shipment of normalized) {
+        const previous = previousById.get(shipment.id);
+        const changed =
+          !previous ||
+          previous.status !== shipment.status ||
+          previous.party_name !== shipment.party_name ||
+          previous.truck_number !== shipment.truck_number ||
+          previous.destination !== shipment.destination ||
+          Number(previous.advance_paid) !== shipment.advance_paid ||
+          Number(previous.balance_due) !== shipment.balance_due;
+        if (changed) changedIds.push(shipment.id);
       }
-    }
-  }, [handleIncomingPayload]);
+      return normalized;
+    });
+
+    changedIds.forEach(triggerHighlight);
+  }, [triggerHighlight]);
 
   useEffect(() => {
     fetchShipmentsFromBackend();

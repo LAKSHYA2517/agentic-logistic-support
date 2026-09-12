@@ -179,6 +179,19 @@ def test_failed_shipment_is_delayed(client):
     assert entry["status"] == "DELAYED"
 
 
+def test_delivered_shipment_is_delivered(client):
+    # Regression test: DELIVERED (set by the POD verification flow) must
+    # map to the dashboard's own "DELIVERED" status, not fall through to
+    # the PENDING_LOADING default.
+    test_client, session_factory = client
+    with session_factory() as session:
+        _make_shipment(session, status=ShipmentStatus.DELIVERED)
+
+    entry = test_client.get("/api/shipments").json()[0]
+
+    assert entry["status"] == "DELIVERED"
+
+
 def test_response_shape_matches_dashboard_expectations(client):
     test_client, session_factory = client
     with session_factory() as session:

@@ -22,3 +22,4 @@ class WebhookResponse(BaseModel):
     failed: int = 0
     driver_confirmed: int = 0
     driver_rejected: int = 0
+    pod_processed: int = 0

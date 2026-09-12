@@ -164,6 +164,47 @@ def extract_audio_messages(payload: dict[str, Any]) -> list[ParsedMetaMessage]:
     return extracted
 
 
+def extract_pod_messages(payload: dict[str, Any]) -> list[ParsedMetaMessage]:
+    """Extract image/document (POD) messages.
+
+    Mirrors ``extract_audio_messages`` -- same envelope-walking helpers,
+    just filtered to ``type in {"image", "document"}`` messages, since a
+    driver's proof-of-delivery photo/PDF arrives the same shape as a
+    voice note does, only under a different message type/media key.
+    """
+
+    extracted: list[ParsedMetaMessage] = []
+
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                message_type = _optional_string(message.get("type"))
+                if message_type not in {"image", "document"}:
+                    continue
+
+                media = message.get(message_type)
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                media_id = _optional_string(media.get("id")) if isinstance(media, dict) else None
+                extracted.append(
+                    ParsedMetaMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        media_id=media_id,
+                        message_type=message_type,
+                    )
+                )
+
+    return extracted
+
+
 def _dict_items(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []

@@ -80,10 +80,14 @@ def _dashboard_status(shipment: Shipment) -> str:
     """
 
     if shipment.status in (ShipmentStatus.FAILED, ShipmentStatus.PARSED):
-        # PARSED means Phase 2 flagged the extraction for human review
-        # (NEEDS_REVIEW) -- that is an exception state, not a routine
-        # "still loading" one.
+        # PARSED means either Phase 2 flagged the voice extraction for
+        # human review (NEEDS_REVIEW), or the POD verification step
+        # flagged a conflicting/uncertain proof of delivery -- both are
+        # exception states, not a routine "still loading" one.
         return "DELAYED"
+
+    if shipment.status is ShipmentStatus.DELIVERED:
+        return "DELIVERED"
 
     if shipment.status is ShipmentStatus.COMPLETED:
         confirmation: Optional[DriverConfirmationStatus] = shipment.driver_confirmation_status
