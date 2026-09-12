@@ -204,12 +204,10 @@ class ProcessingResult(BaseModel):
 
 
 class OCRResult(BaseModel):
-    """Result of running one perception provider (OCR or Vision) over an image/document.
+    """Result of running a document-perception provider over a file.
 
-    This model is intentionally shared by both ``OCRProvider`` and
-    ``VisionProvider`` implementations -- they play the same role
-    (file -> raw text) and the perception orchestration layer treats
-    their outputs identically.
+    The provider converts a supported image/document into raw text, and
+    the perception orchestration layer adds a deterministic quality verdict.
 
     ``confidence`` is ``None`` whenever the underlying provider does
     not supply a reliable confidence score -- it is never fabricated.

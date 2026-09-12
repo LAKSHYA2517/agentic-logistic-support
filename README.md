@@ -18,7 +18,7 @@ Meta POST /meta-webhook
             -> update the same Shipment row
 ```
 
-Document OCR is also available as an independent intelligence capability: AI4Bharat IndicOCR runs first, and an injected Vision provider is used only when OCR quality is poor or failed. It is not part of the voice-note webhook path.
+Document perception is also available as an independent intelligence capability using Sarvam Vision's asynchronous Document AI flow. It is not part of the voice-note webhook path.
 
 ## Setup
 
@@ -50,12 +50,15 @@ On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 | `MEDIA_DOWNLOAD_DIR` | No | `/tmp` |
 | `MEDIA_MAX_BYTES` | No | `16777216` |
 | `INTELLIGENCE_ENABLED` | No | `true`; set `false` to demo ingestion only |
-| `SARVAM_API_KEY` | For voice intelligence | Sarvam STT credential |
+| `SARVAM_API_KEY` | For Sarvam features | Shared Sarvam STT and Vision credential |
 | `SARVAM_STT_URL` | No | Sarvam speech-to-text endpoint |
 | `GROQ_API_KEY` | For voice intelligence | Groq credential |
 | `GROQ_CHAT_COMPLETIONS_URL` | No | Groq OpenAI-compatible endpoint |
-| `INDICOCR_API_URL` | For document OCR | Deployment-specific IndicOCR endpoint |
-| `INDICOCR_API_KEY` | Sometimes | Optional for self-hosted OCR |
+| `SARVAM_VISION_LANGUAGE` | No | `hi-IN`; document language hint |
+| `SARVAM_VISION_OUTPUT_FORMAT` | No | `md`; `md` or `html` |
+| `SARVAM_VISION_CONTENT_TYPE` | No | `mixed`; `printed`, `handwritten`, or `mixed` |
+| `SARVAM_VISION_POLL_INTERVAL_SECONDS` | No | `5` |
+| `SARVAM_VISION_MAX_WAIT_SECONDS` | No | `120` |
 | `APP_HOST`, `APP_PORT` | No | `127.0.0.1`, `8000` |
 | `APP_DEBUG`, `APP_RELOAD` | No | `false`, `false` |
 | `LOG_LEVEL` | No | `INFO` |
@@ -170,5 +173,6 @@ Free ngrok URLs usually change after restart, so update Meta when the forwarding
 - Only `audio/ogg` with an Ogg container header is accepted. There is no transcoding.
 - Meta POST signature verification is not yet implemented.
 - Failed jobs do not have an automatic retry endpoint.
-- The document OCR adapter needs a deployment-specific `INDICOCR_API_URL`. Phase 2 defines a Vision-provider interface but does not ship a concrete Sarvam Vision adapter.
+- Document perception accepts PDF, PNG, JPEG, and ZIP inputs. It polls Sarvam's asynchronous Document AI job in-process for at most `SARVAM_VISION_MAX_WAIT_SECONDS`; callers should move this to durable background work if document volume grows.
+- Live Sarvam Vision use requires a valid `SARVAM_API_KEY` with access to the Document AI service.
 - Unit and integration tests mock all external APIs and do not require live credentials.

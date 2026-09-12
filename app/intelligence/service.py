@@ -24,8 +24,6 @@ pipeline, and applies the result to that same row.
 from __future__ import annotations
 
 import logging
-import os
-import re
 from typing import Awaitable, Callable, Protocol
 
 from sqlalchemy.orm import Session
@@ -37,6 +35,7 @@ from app.intelligence.decision import (
 from app.intelligence.exceptions import ExtractionError, MediaValidationError, SttError
 from app.intelligence.extraction import extract_logistics_data
 from app.intelligence.media_validator import validate_media
+from app.intelligence.http_support import sanitize_provider_message
 from app.intelligence.models import (
     LogisticsExtraction,
     MediaMetadata,
@@ -195,28 +194,6 @@ async def run_audio_pipeline(
     return result
 
 
-def sanitize_processing_error(reason: str) -> str:
-    """Remove configured credentials and URLs before persistence or logging."""
-
-    safe_reason = " ".join(reason.split())
-    for variable in (
-        "META_ACCESS_TOKEN",
-        "SARVAM_API_KEY",
-        "GROQ_API_KEY",
-        "INDICOCR_API_KEY",
-    ):
-        secret = os.getenv(variable)
-        if secret:
-            safe_reason = safe_reason.replace(secret, "<redacted>")
-    safe_reason = re.sub(
-        r"(?i)\b(bearer|token|api[_ -]?key)\s*[:=]?\s*[^\s,;]+",
-        r"\1 <redacted>",
-        safe_reason,
-    )
-    safe_reason = re.sub(r"https?://\S+", "<url>", safe_reason)
-    return safe_reason[:1000]
-
-
 async def process_audio(
     shipment_id: int,
     *,
@@ -259,12 +236,12 @@ async def process_audio(
     except Exception as exc:
         result = _failed_result(
             shipment_id,
-            sanitize_processing_error(f"Unexpected intelligence failure: {exc}"),
+            sanitize_provider_message(f"Unexpected intelligence failure: {exc}"),
         )
 
     if result.reason is not None:
         result = result.model_copy(
-            update={"reason": sanitize_processing_error(result.reason)}
+            update={"reason": sanitize_provider_message(result.reason)}
         )
 
     with session_factory() as session:

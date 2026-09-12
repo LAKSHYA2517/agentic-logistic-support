@@ -14,9 +14,9 @@ Voice notes (Phase 2A-2G):
     Entry point: :func:`process_audio`.
 
 Documents/photos (Phase 2H):
-    image/document -> AI4Bharat IndicOCR -> quality gate -> Sarvam
-    Vision fallback (only if OCR quality is POOR/FAILED) ->
-    :class:`OCRResult`. Entry point: :func:`extract_document_text`.
+    image/document -> Sarvam Vision document digitisation -> deterministic
+    quality annotation -> :class:`OCRResult`.
+    Entry point: :func:`extract_document_text`.
 
 :class:`ShipmentRepository` is the concrete adapter over the shared
 SQLAlchemy session and model.

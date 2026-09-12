@@ -1,17 +1,15 @@
-"""Shared HTTP-adapter plumbing used by every Phase 2 external provider adapter.
+"""Shared HTTP-adapter plumbing for Phase 2's direct HTTP integrations.
 
-Sarvam STT (``stt.py``), Groq/Qwen3 extraction (``extraction.py``), and
-AI4Bharat IndicOCR (``ocr.py``) each call an external HTTP API under
-the same operational policy: a lazily-created, injectable
+Sarvam STT (``stt.py``) and Groq/Qwen3 extraction (``extraction.py``)
+call external HTTP APIs under the same operational policy: a lazily-created, injectable
 ``httpx.AsyncClient``, and bounded exponential backoff on
-rate-limiting/server errors. This module is the single place that
-policy lives, so a future change to it (e.g. adding jitter, honoring
-``Retry-After``) only needs to be made once instead of three times.
+rate-limiting/server errors. Sarvam Vision uses Sarvam's official SDK, but
+shares the credential-safe error sanitizer defined here.
 
 What is deliberately NOT unified here: each adapter's own typed
 exception hierarchy, its exact status-code-to-outcome mapping, and
 whether a terminal failure is raised (``stt.py``/``extraction.py``) or
-returned as data (``ocr.py``, by design -- see its module docstring).
+returned as data (``ocr.py``).
 Those are meaningful, adapter-specific choices, not accidental
 duplication, so collapsing them would trade a real behavioral
 distinction for surface-level uniformity.
@@ -19,9 +17,33 @@ distinction for surface-level uniformity.
 
 from __future__ import annotations
 
+import os
+import re
+
 import httpx
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def sanitize_provider_message(message: str) -> str:
+    """Redact configured credentials and URLs from provider failure text."""
+
+    safe_message = " ".join(message.split())
+    for variable in (
+        "META_ACCESS_TOKEN",
+        "SARVAM_API_KEY",
+        "GROQ_API_KEY",
+    ):
+        secret = os.getenv(variable)
+        if secret:
+            safe_message = safe_message.replace(secret, "<redacted>")
+    safe_message = re.sub(
+        r"(?i)\b(bearer|token|api[_ -]?key)\s*[:=]?\s*[^\s,;]+",
+        r"\1 <redacted>",
+        safe_message,
+    )
+    safe_message = re.sub(r"https?://\S+", "<url>", safe_message)
+    return safe_message[:1000]
 
 
 def backoff_delay_seconds(attempt: int, backoff_base_seconds: float) -> float:

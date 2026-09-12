@@ -1,9 +1,14 @@
-import httpx
+from types import SimpleNamespace
+
 import pytest
 
 from app.intelligence.exceptions import OcrConfigurationError
 from app.intelligence.models import OCRQuality, OCRResult
-from app.intelligence.ocr import PROVIDER_NAME, IndicOCRProvider, evaluate_ocr_quality
+from app.intelligence.ocr import (
+    PROVIDER_NAME,
+    SarvamVisionProvider,
+    evaluate_ocr_quality,
+)
 
 
 @pytest.fixture
@@ -13,388 +18,234 @@ def image_file(tmp_path):
     return str(path)
 
 
-def make_provider(handler, **kwargs) -> IndicOCRProvider:
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    return IndicOCRProvider(
-        api_url="https://indicocr.example.internal/ocr",
-        api_key="test-key",
-        http_client=client,
-        backoff_base_seconds=0,
+class FakeDocAI:
+    def __init__(
+        self,
+        *,
+        initial_status="pending",
+        statuses=None,
+        pages=None,
+        digitise_error: Exception | None = None,
+        job_id="vision-job-1",
+    ):
+        self.initial_status = initial_status
+        self.statuses = list(statuses or ["completed"])
+        self.pages = pages if pages is not None else ["Delivery challan", "Truck RJ14GB1122"]
+        self.digitise_error = digitise_error
+        self.job_id = job_id
+        self.digitise_kwargs = None
+        self.status_calls = 0
+        self.results_calls = 0
+
+    async def digitise(self, **kwargs):
+        self.digitise_kwargs = kwargs
+        if self.digitise_error is not None:
+            raise self.digitise_error
+        return SimpleNamespace(job_id=self.job_id, status=self.initial_status)
+
+    async def get_status(self, job_id):
+        assert job_id == self.job_id
+        self.status_calls += 1
+        status = self.statuses.pop(0) if self.statuses else "completed"
+        return SimpleNamespace(status=status)
+
+    async def get_results(self, job_id):
+        assert job_id == self.job_id
+        self.results_calls += 1
+        pages = [SimpleNamespace(content=content) for content in self.pages]
+        return SimpleNamespace(documents=[SimpleNamespace(pages=pages)])
+
+
+class FakeClient:
+    def __init__(self, doc_ai: FakeDocAI):
+        self.doc_ai = doc_ai
+
+
+def make_provider(doc_ai: FakeDocAI, **kwargs) -> SarvamVisionProvider:
+    return SarvamVisionProvider(
+        client=FakeClient(doc_ai),
+        language="hi-IN",
+        output_format="md",
+        content_type="mixed",
+        poll_interval_seconds=0,
+        max_wait_seconds=1,
         **kwargs,
     )
 
 
-# ---------------------------------------------------------------------------
-# Adapter: success cases across languages
-# ---------------------------------------------------------------------------
+async def test_successful_extraction_and_request_shape(image_file):
+    doc_ai = FakeDocAI()
+
+    result = await make_provider(doc_ai).extract_text(image_file)
+
+    assert result == OCRResult(
+        text="Delivery challan\n\nTruck RJ14GB1122",
+        provider=PROVIDER_NAME,
+        confidence=None,
+        success=True,
+        metadata={
+            "job_id": "vision-job-1",
+            "status": "completed",
+            "pages": 2,
+            "language": "hi-IN",
+            "output_format": "md",
+        },
+    )
+    assert doc_ai.digitise_kwargs["language"] == "hi-IN"
+    assert doc_ai.digitise_kwargs["output_format"] == "md"
+    assert doc_ai.digitise_kwargs["content_type"] == "mixed"
+    assert doc_ai.digitise_kwargs["model"] == "sarvam-vision"
+    filename, data, media_type = doc_ai.digitise_kwargs["file"][0]
+    assert filename == "pod.jpg"
+    assert data.startswith(b"\xff\xd8\xff")
+    assert media_type == "image/jpeg"
+    assert doc_ai.status_calls == 1
+    assert doc_ai.results_calls == 1
 
 
-async def test_successful_extraction_english(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "Ramesh Logistics Pvt Ltd\nTruck RJ14GB1122"})
+async def test_polling_continues_until_completed(image_file):
+    doc_ai = FakeDocAI(statuses=["running", "pending", "completed"])
 
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert isinstance(result, OCRResult)
-    assert result.success is True
-    assert result.provider == PROVIDER_NAME
-    assert "RJ14GB1122" in result.text
-
-
-async def test_successful_extraction_hindi(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "प्राप्तकर्ता: रमेश\nदिनांक: 12/09/2026"})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.success is True
-    assert "रमेश" in result.text
-
-
-async def test_successful_extraction_hinglish(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "Truck RJ14GB1122 delivery Delhi mein hui"})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.success is True
-    assert "Delhi" in result.text
-
-
-async def test_confidence_passed_through_when_provided(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "some text", "confidence": 0.92})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.confidence == 0.92
-
-
-async def test_confidence_none_when_not_provided(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "some text"})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.confidence is None
-
-
-async def test_confidence_never_fabricated_when_field_is_wrong_type(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": "some text", "confidence": "high"})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.confidence is None
-
-
-# ---------------------------------------------------------------------------
-# Adapter: failures are returned as data, never raised
-# ---------------------------------------------------------------------------
-
-
-async def test_empty_text_response_is_represented_as_success_with_empty_text(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"text": ""})
-
-    result = await make_provider(handler).extract_text(image_file)
+    result = await make_provider(doc_ai).extract_text(image_file)
 
     assert result.success is True
-    assert result.text == ""
+    assert doc_ai.status_calls == 3
 
 
-async def test_malformed_json_returns_failed_result_not_exception(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"not json")
+async def test_partially_completed_job_is_accepted(image_file):
+    doc_ai = FakeDocAI(initial_status="partially_completed", pages=["Readable page"])
 
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.success is False
-    assert "error" in result.metadata
-
-
-async def test_missing_text_field_returns_failed_result(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"unexpected": "shape"})
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.success is False
-
-
-async def test_400_returns_failed_result_without_retry(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        return httpx.Response(400, text="bad request")
-
-    result = await make_provider(handler, max_retries=3).extract_text(image_file)
-
-    assert result.success is False
-    assert call_count == 1
-
-
-async def test_401_returns_failed_result_without_retry(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        return httpx.Response(401, text="invalid api key")
-
-    result = await make_provider(handler, max_retries=3).extract_text(image_file)
-
-    assert result.success is False
-    assert call_count == 1
-
-
-async def test_403_returns_failed_result(image_file):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, text="forbidden")
-
-    result = await make_provider(handler).extract_text(image_file)
-
-    assert result.success is False
-
-
-async def test_429_retries_then_returns_failed_result(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        return httpx.Response(429, text="rate limited")
-
-    result = await make_provider(handler, max_retries=2).extract_text(image_file)
-
-    assert result.success is False
-    assert call_count == 3
-
-
-async def test_429_then_success_returns_successful_result(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        if call_count < 2:
-            return httpx.Response(429, text="rate limited")
-        return httpx.Response(200, json={"text": "recovered text"})
-
-    result = await make_provider(handler, max_retries=3).extract_text(image_file)
+    result = await make_provider(doc_ai).extract_text(image_file)
 
     assert result.success is True
-    assert result.text == "recovered text"
-    assert call_count == 2
+    assert result.metadata["status"] == "partially_completed"
+    assert doc_ai.status_calls == 0
 
 
-async def test_5xx_retries_then_returns_failed_result(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        return httpx.Response(503, text="service unavailable")
-
-    result = await make_provider(handler, max_retries=2).extract_text(image_file)
+@pytest.mark.parametrize("status", ["failed", "rejected"])
+async def test_terminal_failure_is_returned_as_data(image_file, status):
+    result = await make_provider(FakeDocAI(initial_status=status)).extract_text(image_file)
 
     assert result.success is False
-    assert call_count == 3
-
-
-async def test_timeout_retries_then_returns_failed_result(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        raise httpx.ReadTimeout("timed out", request=request)
-
-    result = await make_provider(handler, max_retries=1).extract_text(image_file)
-
-    assert result.success is False
-    assert call_count == 2
-
-
-async def test_network_error_retries_then_returns_failed_result(image_file):
-    call_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        raise httpx.ConnectError("connection refused", request=request)
-
-    result = await make_provider(handler, max_retries=1).extract_text(image_file)
-
-    assert result.success is False
-    assert call_count == 2
+    assert status in result.metadata["error"]
 
 
 async def test_missing_file_returns_failed_result(tmp_path):
-    provider = make_provider(lambda request: httpx.Response(200, json={"text": "unused"}))
-
-    result = await provider.extract_text(str(tmp_path / "does_not_exist.jpg"))
+    result = await make_provider(FakeDocAI()).extract_text(str(tmp_path / "missing.jpg"))
 
     assert result.success is False
-    assert "error" in result.metadata
+    assert "not found" in result.metadata["error"]
 
 
-# ---------------------------------------------------------------------------
-# Adapter: configuration / request shape
-# ---------------------------------------------------------------------------
+async def test_unsupported_file_type_returns_failed_result(tmp_path):
+    path = tmp_path / "pod.txt"
+    path.write_text("not a supported document")
+
+    result = await make_provider(FakeDocAI()).extract_text(str(path))
+
+    assert result.success is False
+    assert "unsupported" in result.metadata["error"]
 
 
-async def test_missing_api_url_raises_configuration_error(monkeypatch):
-    monkeypatch.delenv("INDICOCR_API_URL", raising=False)
+async def test_invalid_job_response_returns_failed_result(image_file):
+    result = await make_provider(FakeDocAI(job_id="")).extract_text(image_file)
+
+    assert result.success is False
+    assert "invalid job response" in result.metadata["error"]
+
+
+async def test_invalid_status_response_returns_failed_result(image_file):
+    doc_ai = FakeDocAI(statuses=[None])
+
+    result = await make_provider(doc_ai).extract_text(image_file)
+
+    assert result.success is False
+    assert "invalid status response" in result.metadata["error"]
+
+
+async def test_empty_results_return_failed_result(image_file):
+    result = await make_provider(FakeDocAI(initial_status="completed", pages=[])).extract_text(
+        image_file
+    )
+
+    assert result.success is False
+    assert "no document text" in result.metadata["error"]
+
+
+async def test_polling_timeout_returns_failed_result(image_file):
+    provider = SarvamVisionProvider(
+        client=FakeClient(FakeDocAI(statuses=["running"])),
+        poll_interval_seconds=0,
+        max_wait_seconds=0,
+    )
+
+    result = await provider.extract_text(image_file)
+
+    assert result.success is False
+    assert "timed out" in result.metadata["error"]
+
+
+async def test_provider_error_is_sanitized(image_file, monkeypatch):
+    secret = "sarvam-secret-value"
+    monkeypatch.setenv("SARVAM_API_KEY", secret)
+    error = RuntimeError(
+        f"Bearer {secret} failed at https://api.sarvam.ai/doc-ai/v1"
+    )
+
+    result = await make_provider(FakeDocAI(digitise_error=error)).extract_text(image_file)
+
+    message = result.metadata["error"]
+    assert result.success is False
+    assert secret not in message
+    assert "https://" not in message
+    assert "<redacted>" in message
+
+
+def test_missing_api_key_raises_configuration_error(monkeypatch):
+    monkeypatch.delenv("SARVAM_API_KEY", raising=False)
 
     with pytest.raises(OcrConfigurationError):
-        IndicOCRProvider()
+        SarvamVisionProvider()
 
 
-async def test_api_key_included_when_provided(image_file):
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["headers"] = request.headers
-        return httpx.Response(200, json={"text": "ok"})
-
-    await make_provider(handler).extract_text(image_file)
-
-    assert captured["headers"]["authorization"] == "Bearer test-key"
-
-
-async def test_api_key_omitted_when_not_configured(image_file):
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["headers"] = request.headers
-        return httpx.Response(200, json={"text": "ok"})
-
-    transport = httpx.MockTransport(handler)
-    client = httpx.AsyncClient(transport=transport)
-    provider = IndicOCRProvider(
-        api_url="https://indicocr.example.internal/ocr",
-        api_key=None,
-        http_client=client,
-        backoff_base_seconds=0,
-    )
-
-    await provider.extract_text(image_file)
-
-    assert "authorization" not in captured["headers"]
-
-
-# ---------------------------------------------------------------------------
-# Quality gate
-# ---------------------------------------------------------------------------
-
-
-def test_quality_gate_good_english_logistics_text():
-    result = OCRResult(
-        text="Ramesh Logistics Pvt Ltd\nTruck RJ14GB1122\nDelivered",
-        provider=PROVIDER_NAME,
-        success=True,
-    )
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ramesh Logistics Pvt Ltd Truck RJ14GB1122 Delivered",
+        "प्राप्तकर्ता रमेश दिनांक 12/09/2026",
+        "Truck RJ14GB1122 ka delivery challan Delhi mein",
+        "வணக்கம் ராமேஷ் லாரி எண் 1122",
+        "నమస్కారం రమేష్ లారీ సంఖ్య 1122",
+        "নমস্কার রমেশ ট্রাক নম্বর 1122",
+        "خوش آمدید رمیش ٹرک نمبر 1122",
+    ],
+)
+def test_quality_gate_accepts_meaningful_multilingual_text(text):
+    result = OCRResult(text=text, provider=PROVIDER_NAME, success=True)
 
     assert evaluate_ocr_quality(result) == OCRQuality.GOOD
 
 
-def test_quality_gate_good_hindi_text():
-    result = OCRResult(
-        text="प्राप्तकर्ता रमेश दिनांक 12/09/2026",
-        provider=PROVIDER_NAME,
-        success=True,
-    )
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_good_hinglish_text():
-    result = OCRResult(
-        text="Truck RJ14GB1122 ka delivery challan Delhi mein",
-        provider=PROVIDER_NAME,
-        success=True,
-    )
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_good_tamil_text():
-    result = OCRResult(text="வணக்கம் ராமேஷ் லாரி எண் 1122", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_good_telugu_text():
-    result = OCRResult(text="నమస్కారం రమేష్ లారీ సంఖ్య 1122", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_good_bengali_text():
-    result = OCRResult(text="নমস্কার রমেশ ট্রাক নম্বর 1122", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_good_urdu_text():
-    result = OCRResult(text="خوش آمدید رمیش ٹرک نمبر 1122", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD
-
-
-def test_quality_gate_poor_symbol_noise():
-    result = OCRResult(text="@@@ ### ^^^", provider=PROVIDER_NAME, success=True)
+@pytest.mark.parametrize("text", ["@@@ ### ^^^", "RJ ##### @@@@@ ^^^^^", "###"])
+def test_quality_gate_marks_symbol_noise_poor(text):
+    result = OCRResult(text=text, provider=PROVIDER_NAME, success=True, confidence=0.99)
 
     assert evaluate_ocr_quality(result) == OCRQuality.POOR
 
 
-def test_quality_gate_failed_empty_text():
-    result = OCRResult(text="", provider=PROVIDER_NAME, success=True)
+@pytest.mark.parametrize("text", ["", "   \n\t  "])
+def test_quality_gate_marks_empty_text_failed(text):
+    result = OCRResult(text=text, provider=PROVIDER_NAME, success=True)
 
     assert evaluate_ocr_quality(result) == OCRQuality.FAILED
 
 
-def test_quality_gate_failed_whitespace_only():
-    result = OCRResult(text="   \n\t  ", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.FAILED
-
-
-def test_quality_gate_failed_when_success_is_false_regardless_of_text():
+def test_quality_gate_marks_provider_failure_failed():
     result = OCRResult(
-        text="this text should be ignored",
+        text="text is ignored",
         provider=PROVIDER_NAME,
         success=False,
-        metadata={"error": "network failure"},
+        metadata={"error": "provider failure"},
     )
 
     assert evaluate_ocr_quality(result) == OCRQuality.FAILED
-
-
-def test_quality_gate_ignores_confidence_score():
-    # A high self-reported confidence must not override a text-based POOR verdict.
-    result = OCRResult(
-        text="###", provider=PROVIDER_NAME, success=True, confidence=0.99
-    )
-
-    assert evaluate_ocr_quality(result) == OCRQuality.POOR
-
-
-def test_quality_gate_poor_mostly_noise_with_a_little_text():
-    result = OCRResult(text="RJ ##### @@@@@ ^^^^^", provider=PROVIDER_NAME, success=True)
-
-    assert evaluate_ocr_quality(result) == OCRQuality.POOR
-
-
-def test_quality_gate_good_truck_number_and_indian_names():
-    result = OCRResult(
-        text="Suresh Transport Co, Vehicle No RJ14GB1122, Jaipur to Delhi",
-        provider=PROVIDER_NAME,
-        success=True,
-    )
-
-    assert evaluate_ocr_quality(result) == OCRQuality.GOOD

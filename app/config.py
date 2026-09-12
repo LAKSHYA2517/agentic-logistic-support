@@ -90,11 +90,26 @@ class AppSettings(BaseModel):
             "https://api.groq.com/openai/v1/chat/completions",
         )
     )
-    indicocr_api_url: Optional[str] = Field(
-        default_factory=lambda: os.getenv("INDICOCR_API_URL") or None
+    sarvam_vision_language: str = Field(
+        default_factory=lambda: os.getenv("SARVAM_VISION_LANGUAGE", "hi-IN")
     )
-    indicocr_api_key: Optional[str] = Field(
-        default_factory=lambda: os.getenv("INDICOCR_API_KEY") or None
+    sarvam_vision_output_format: Literal["md", "html"] = Field(
+        default_factory=lambda: os.getenv("SARVAM_VISION_OUTPUT_FORMAT", "md")
+    )
+    sarvam_vision_content_type: Literal["printed", "handwritten", "mixed"] = Field(
+        default_factory=lambda: os.getenv("SARVAM_VISION_CONTENT_TYPE", "mixed")
+    )
+    sarvam_vision_poll_interval_seconds: float = Field(
+        default_factory=lambda: float(
+            os.getenv("SARVAM_VISION_POLL_INTERVAL_SECONDS", "5")
+        ),
+        ge=0,
+    )
+    sarvam_vision_max_wait_seconds: float = Field(
+        default_factory=lambda: float(
+            os.getenv("SARVAM_VISION_MAX_WAIT_SECONDS", "120")
+        ),
+        gt=0,
     )
 
 
