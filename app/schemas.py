@@ -17,5 +17,6 @@ class WebhookResponse(BaseModel):
     status: Literal["accepted", "ignored"]
     shipments_created: int = 0
     duplicates: int = 0
+    processing_queued: int = 0
     media_downloaded: int = 0
     failed: int = 0

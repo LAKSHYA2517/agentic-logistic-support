@@ -70,6 +70,32 @@ class AppSettings(BaseModel):
         default_factory=lambda: int(os.getenv("MEDIA_MAX_BYTES", str(16 * 1024 * 1024))),
         gt=0,
     )
+    intelligence_enabled: bool = Field(
+        default_factory=lambda: _get_bool("INTELLIGENCE_ENABLED", True)
+    )
+    sarvam_api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("SARVAM_API_KEY") or None
+    )
+    sarvam_stt_url: str = Field(
+        default_factory=lambda: os.getenv(
+            "SARVAM_STT_URL", "https://api.sarvam.ai/speech-to-text"
+        )
+    )
+    groq_api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("GROQ_API_KEY") or None
+    )
+    groq_chat_completions_url: str = Field(
+        default_factory=lambda: os.getenv(
+            "GROQ_CHAT_COMPLETIONS_URL",
+            "https://api.groq.com/openai/v1/chat/completions",
+        )
+    )
+    indicocr_api_url: Optional[str] = Field(
+        default_factory=lambda: os.getenv("INDICOCR_API_URL") or None
+    )
+    indicocr_api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("INDICOCR_API_KEY") or None
+    )
 
 
 @lru_cache

@@ -1,18 +1,24 @@
 from collections.abc import Generator
+import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from fastapi import BackgroundTasks, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import AppSettings, get_settings
 from app.database import Base, get_db
+from app.intelligence.models import LogisticsExtraction, STTResult
+from app.intelligence.service import process_audio
 from app.main import app
 from app.models import Shipment, ShipmentStatus, User, UserRole
-from app.services.meta import MetaMediaService, get_meta_media_service
+from app.routes.webhook import receive_meta_webhook
+from app.services.meta import MetaMediaService
+from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
 from app.services.webhook import extract_audio_messages
 
 
@@ -121,10 +127,16 @@ def webhook_client(
             yield session
 
     app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_meta_media_service] = lambda: media_service
-    app.dependency_overrides[get_settings] = lambda: AppSettings(
-        meta_webhook_verify_token="demo-verify-token"
+    test_settings = AppSettings(
+        meta_webhook_verify_token="demo-verify-token",
+        intelligence_enabled=False,
     )
+    app.dependency_overrides[get_shipment_task_runner] = lambda: ShipmentTaskRunner(
+        settings=test_settings,
+        session_factory=testing_session_factory,
+        media_downloader=media_service.download_audio,
+    )
+    app.dependency_overrides[get_settings] = lambda: test_settings
     with TestClient(app) as client:
         yield client, testing_session_factory, meta_requests
     app.dependency_overrides.clear()
@@ -188,7 +200,8 @@ def test_valid_audio_webhook_is_parsed_and_persisted(
         "status": "accepted",
         "shipments_created": 1,
         "duplicates": 0,
-        "media_downloaded": 1,
+        "processing_queued": 1,
+        "media_downloaded": 0,
         "failed": 0,
     }
     assert len(meta_requests) == 2
@@ -246,6 +259,7 @@ def test_missing_optional_message_fields_are_safe(webhook_client: tuple) -> None
         "status": "accepted",
         "shipments_created": 1,
         "duplicates": 0,
+        "processing_queued": 0,
         "media_downloaded": 0,
         "failed": 1,
     }
@@ -284,6 +298,7 @@ def test_irrelevant_and_malformed_payloads_are_ignored(webhook_client: tuple) ->
             "status": "ignored",
             "shipments_created": 0,
             "duplicates": 0,
+            "processing_queued": 0,
             "media_downloaded": 0,
             "failed": 0,
         }
@@ -311,6 +326,7 @@ def test_existing_user_is_reused(webhook_client: tuple) -> None:
         "status": "accepted",
         "shipments_created": 0,
         "duplicates": 1,
+        "processing_queued": 0,
         "media_downloaded": 0,
         "failed": 0,
     }
@@ -334,8 +350,9 @@ def test_media_download_failure_marks_shipment_failed(
         "status": "accepted",
         "shipments_created": 1,
         "duplicates": 0,
+        "processing_queued": 1,
         "media_downloaded": 0,
-        "failed": 1,
+        "failed": 0,
     }
     assert len(meta_requests) == 1
     with session_factory() as session:
@@ -351,6 +368,153 @@ def test_media_download_failure_marks_shipment_failed(
     assert "Temporary failure for <redacted>. See <url>" in caplog.text
     assert "test-access-token" not in caplog.text
     assert "token=secret" not in caplog.text
+
+
+def test_webhook_background_flow_updates_same_shipment(
+    webhook_client: tuple,
+    tmp_path: Path,
+) -> None:
+    client, session_factory, _ = webhook_client
+    calls = {"stt": 0, "extract": 0}
+    meta_calls: list[httpx.Request] = []
+
+    def meta_handler(request: httpx.Request) -> httpx.Response:
+        meta_calls.append(request)
+        assert request.headers["authorization"] == "Bearer integration-token"
+        if request.url.host == "graph.integration.test":
+            assert request.url.path == "/v25.0/media-full-integration"
+            return httpx.Response(
+                200,
+                json={
+                    "url": (
+                        "https://media.integration.test/"
+                        "download/media-full-integration"
+                    )
+                },
+            )
+        return httpx.Response(
+            200,
+            content=b"OggS integrated voice note",
+            headers={"content-type": "audio/ogg"},
+        )
+
+    meta_client = httpx.Client(transport=httpx.MockTransport(meta_handler))
+    media_service = MetaMediaService(
+        access_token="integration-token",
+        graph_api_base_url="https://graph.integration.test",
+        graph_api_version="v25.0",
+        output_dir=tmp_path / "integrated-media",
+        max_media_bytes=1024,
+        http_client=meta_client,
+        phone_number_id="integration-phone-id",
+    )
+
+    async def fake_stt(file_path: str) -> STTResult:
+        calls["stt"] += 1
+        assert Path(file_path).is_file()
+        return STTResult(
+            transcript="Ramesh truck RJ14GB1122 advance das hazaar",
+            provider="fake",
+            model="fake",
+        )
+
+    async def fake_extractor(_: str) -> LogisticsExtraction:
+        calls["extract"] += 1
+        return LogisticsExtraction(
+            party_name="Ramesh",
+            truck_number="RJ14GB1122",
+            advance_paid=10000,
+        )
+
+    async def intelligence_processor(shipment_id: int):
+        return await process_audio(
+            shipment_id,
+            session_factory=session_factory,
+            stt=fake_stt,
+            extractor=fake_extractor,
+        )
+
+    runner = ShipmentTaskRunner(
+        settings=AppSettings(intelligence_enabled=True),
+        session_factory=session_factory,
+        media_downloader=media_service.download_audio,
+        intelligence_processor=intelligence_processor,
+    )
+    app.dependency_overrides[get_shipment_task_runner] = lambda: runner
+    payload = _audio_payload(
+        message_id="wamid.full-integration",
+        media_id="media-full-integration",
+    )
+
+    response = client.post("/meta-webhook", json=payload)
+    duplicate = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json()["processing_queued"] == 1
+    assert duplicate.json()["duplicates"] == 1
+    assert calls == {"stt": 1, "extract": 1}
+    assert len(meta_calls) == 2
+    with session_factory() as session:
+        shipment = session.scalar(select(Shipment))
+        assert shipment is not None
+        assert shipment.status is ShipmentStatus.COMPLETED
+        assert shipment.media_path is not None
+        assert Path(shipment.media_path).read_bytes() == b"OggS integrated voice note"
+        assert shipment.transcript == "Ramesh truck RJ14GB1122 advance das hazaar"
+        assert shipment.extracted_data == {
+            "party_name": "Ramesh",
+            "truck_number": "RJ14GB1122",
+            "advance_paid": 10000,
+            "balance_due": None,
+        }
+        assert shipment.raw_event == payload
+        assert session.scalar(select(func.count()).select_from(Shipment)) == 1
+    meta_client.close()
+
+
+async def test_webhook_route_returns_before_background_work_starts(
+    webhook_client: tuple,
+) -> None:
+    _, session_factory, _ = webhook_client
+    payload = _audio_payload(
+        message_id="wamid.ack-first",
+        media_id="media-ack-first",
+    )
+    body = json.dumps(payload).encode()
+    delivered = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/meta-webhook", "headers": []},
+        receive,
+    )
+    background_tasks = BackgroundTasks()
+    processed: list[int] = []
+
+    async def runner(shipment_id: int) -> None:
+        processed.append(shipment_id)
+
+    with session_factory() as session:
+        response = await receive_meta_webhook(
+            request,
+            background_tasks,
+            session,
+            runner,  # type: ignore[arg-type]
+        )
+
+    assert response.status == "accepted"
+    assert response.processing_queued == 1
+    assert processed == []
+
+    await background_tasks()
+
+    assert len(processed) == 1
 
 
 @pytest.mark.parametrize(
@@ -384,7 +548,8 @@ def test_media_failure_cases_are_recorded_safely(
     )
 
     assert response.status_code == 200
-    assert response.json()["failed"] == 1
+    assert response.json()["processing_queued"] == 1
+    assert response.json()["failed"] == 0
     assert len(meta_requests) == expected_requests
     with session_factory() as session:
         shipment = session.scalar(select(Shipment))

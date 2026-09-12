@@ -4,7 +4,7 @@ import os
 from collections.abc import Generator
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import Engine, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -39,16 +39,16 @@ def init_db() -> None:
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
-    _upgrade_local_sqlite_schema()
+    upgrade_local_sqlite_schema(engine)
 
 
-def _upgrade_local_sqlite_schema() -> None:
+def upgrade_local_sqlite_schema(db_engine: Engine) -> None:
     """Add known MVP columns to SQLite databases created by earlier phases."""
 
-    if not DATABASE_URL.startswith("sqlite"):
+    if db_engine.dialect.name != "sqlite":
         return
 
-    inspector = inspect(engine)
+    inspector = inspect(db_engine)
     if "shipments" not in inspector.get_table_names():
         return
 
@@ -57,9 +57,14 @@ def _upgrade_local_sqlite_schema() -> None:
         "message_id": "VARCHAR(255)",
         "message_type": "VARCHAR(32)",
         "media_error": "TEXT",
+        "transcript": "TEXT",
+        "extracted_data": "JSON",
+        "processing_error": "TEXT",
+        "processing_started_at": "DATETIME",
+        "processing_completed_at": "DATETIME",
     }
 
-    with engine.begin() as connection:
+    with db_engine.begin() as connection:
         for column_name, column_type in column_definitions.items():
             if column_name not in existing_columns:
                 connection.exec_driver_sql(

@@ -1,95 +1,105 @@
 # Agentic Logistic Support
 
-Hackathon-ready FastAPI backend for receiving Meta WhatsApp audio webhooks, preserving the original event in SQLite, and downloading voice media to local temporary storage.
-
-## Phase 1 flow
+One FastAPI application that combines WhatsApp voice-note ingestion with the Phase 2 logistics intelligence pipeline.
 
 ```text
 Meta POST /meta-webhook
-  -> defensively parse audio messages
-  -> create or reuse User
-  -> create RECEIVED Shipment
-  -> resolve the media ID through Meta Graph API
-  -> download authenticated audio/ogg bytes
-  -> save /tmp/shipment-<id>-<random>.ogg
-  -> update Shipment.media_path
+  -> persist User + RECEIVED Shipment and raw payload
+  -> acknowledge Meta
+  -> FastAPI background task
+       -> resolve/download audio/ogg with the Meta media ID
+       -> save Shipment.media_path
+       -> process_audio(shipment_id)
+            -> validate media
+            -> Sarvam Saaras v3 STT
+            -> normalize transcript
+            -> Groq/Qwen3 extraction
+            -> deterministic validation and decision
+            -> update the same Shipment row
 ```
 
-Failed media retrieval leaves the raw event intact, sets the shipment to `FAILED`, and stores a sanitized error. A repeated Meta message ID is acknowledged without creating or downloading another shipment.
+Document OCR is also available as an independent intelligence capability: AI4Bharat IndicOCR runs first, and an injected Vision provider is used only when OCR quality is poor or failed. It is not part of the voice-note webhook path.
 
-## Local setup
+## Setup
 
-Python 3.10 or newer is recommended.
+Python 3.11 or newer is required.
 
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-On Windows PowerShell, activate the environment with:
+On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 
-```powershell
-.venv\Scripts\Activate.ps1
+## Configuration
+
+`.env` is loaded with `python-dotenv`, is ignored by Git, and must never be committed. Environment variables supplied by the deployment take precedence.
+
+| Variable | Required | Default / purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | No | `sqlite:///./app.db` |
+| `META_WEBHOOK_VERIFY_TOKEN` | For Meta setup | Secret value chosen for webhook verification |
+| `META_ACCESS_TOKEN` | For media | Meta Graph API bearer token |
+| `META_WABA_ID` | Account setup | WABA context; never substituted for a webhook media ID |
+| `META_PHONE_NUMBER_ID` | Recommended | Sent as media lookup context |
+| `META_API_VERSION` | No | `v25.0` |
+| `META_GRAPH_API_BASE_URL` | No | `https://graph.facebook.com` |
+| `META_REQUEST_TIMEOUT_SECONDS` | No | `20` |
+| `MEDIA_DOWNLOAD_DIR` | No | `/tmp` |
+| `MEDIA_MAX_BYTES` | No | `16777216` |
+| `INTELLIGENCE_ENABLED` | No | `true`; set `false` to demo ingestion only |
+| `SARVAM_API_KEY` | For voice intelligence | Sarvam STT credential |
+| `SARVAM_STT_URL` | No | Sarvam speech-to-text endpoint |
+| `GROQ_API_KEY` | For voice intelligence | Groq credential |
+| `GROQ_CHAT_COMPLETIONS_URL` | No | Groq OpenAI-compatible endpoint |
+| `INDICOCR_API_URL` | For document OCR | Deployment-specific IndicOCR endpoint |
+| `INDICOCR_API_KEY` | Sometimes | Optional for self-hosted OCR |
+| `APP_HOST`, `APP_PORT` | No | `127.0.0.1`, `8000` |
+| `APP_DEBUG`, `APP_RELOAD` | No | `false`, `false` |
+| `LOG_LEVEL` | No | `INFO` |
+
+The application never logs configured access tokens, API keys, authorization headers, signed download URLs, or full webhook payloads.
+
+## Database and statuses
+
+Startup creates missing tables and performs an additive SQLite compatibility upgrade. Existing `app.db` rows are retained; the migration only adds known missing columns and the message-ID unique index. For production-grade schema history, replace this MVP migration with Alembic.
+
+There is one canonical `Shipment` model. Phase 2 stores:
+
+- `transcript`
+- `extracted_data` JSON (`party_name`, `truck_number`, `advance_paid`, `balance_due`)
+- `processing_error`
+- `processing_started_at` and `processing_completed_at`
+
+Status mapping:
+
+```text
+RECEIVED -> TRANSCRIBING -> COMPLETED       accepted extraction
+                         -> PARSED          human review needed
+                         -> FAILED          media/provider/pipeline failure
 ```
 
-## Environment variables
+Existing `CONFIRMED` and `PROCESSING` values remain available for later business workflow phases. `IN_TRANSIT` is intentionally not introduced during this integration.
 
-Edit `.env` before connecting Meta. `.env` is ignored by Git and must not be committed.
-
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `META_ACCESS_TOKEN` | Yes for downloads | Empty | Meta Graph API bearer token |
-| `META_WEBHOOK_VERIFY_TOKEN` | Yes for Meta setup | Empty | Private value chosen by you and entered in Meta |
-| `META_WABA_ID` | Recommended for account setup | Empty | WhatsApp Business Account context; never used as a media ID |
-| `META_PHONE_NUMBER_ID` | Recommended | Empty | Restricts media lookup to the configured WhatsApp number |
-| `META_API_VERSION` | No | `v25.0` | Graph API version; confirm it is supported by your Meta app |
-| `DATABASE_URL` | No | `sqlite:///./app.db` | SQLAlchemy database URL |
-| `MEDIA_DOWNLOAD_DIR` | No | `/tmp` | Writable media destination |
-| `MEDIA_MAX_BYTES` | No | `16777216` | Maximum accepted download size |
-| `META_REQUEST_TIMEOUT_SECONDS` | No | `20` | Meta lookup/download timeout |
-| `LOG_LEVEL` | No | `INFO` | Application log level |
-| `APP_HOST` / `APP_PORT` | No | `127.0.0.1` / `8000` | Direct Python entry-point bind settings |
-| `APP_DEBUG` / `APP_RELOAD` | No | `false` / `false` | Development switches |
-
-Use a random verification token, for example:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Do not paste access tokens into source code, shell history, logs, screenshots, or bug reports.
-
-## Database
-
-The application creates `users` and `shipments` automatically when it starts. The default SQLite file is `app.db`. A small compatibility upgrade adds Phase 1 columns to SQLite databases created by earlier iterations.
-
-For a completely fresh local database, stop the server and move the old `app.db` somewhere safe before restarting. Production schema evolution should use a migration tool rather than automatic table creation.
-
-## Run the API
+## Run and test
 
 ```bash
 uvicorn app.main:app --reload
-```
-
-Check the server:
-
-```bash
 curl --fail http://127.0.0.1:8000/health
+pytest -q
 ```
 
-Expected response:
+Expected health response:
 
 ```json
 {"status":"ok"}
 ```
 
-## Meta webhook verification
+## Meta webhook setup
 
-Meta verifies the callback with a `GET` request. The application returns `hub.challenge` as plain text only when `hub.mode=subscribe` and `hub.verify_token` matches `META_WEBHOOK_VERIFY_TOKEN`.
-
-Local verification example:
+Verification request:
 
 ```bash
 curl --get http://127.0.0.1:8000/meta-webhook \
@@ -98,27 +108,7 @@ curl --get http://127.0.0.1:8000/meta-webhook \
   --data-urlencode 'hub.challenge=demo-challenge'
 ```
 
-## Expose the API with ngrok
-
-Install the [ngrok agent](https://ngrok.com/docs/getting-started/), sign in, and configure its authtoken. With FastAPI running on port 8000, open a second terminal:
-
-```bash
-ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
-ngrok http 8000
-```
-
-Copy the HTTPS forwarding address shown by ngrok, such as `https://example-subdomain.ngrok.app`.
-
-In **Meta App Dashboard → WhatsApp → Configuration → Webhooks**:
-
-1. Set the callback URL to `https://YOUR-NGROK-DOMAIN/meta-webhook`.
-2. Enter exactly the same value configured as `META_WEBHOOK_VERIFY_TOKEN`.
-3. Click **Verify and save**.
-4. Subscribe the webhook to the `messages` field.
-
-Free ngrok URLs can change when the agent restarts. If yours changes, update the callback URL in Meta.
-
-## Example webhook
+Example audio payload:
 
 ```json
 {
@@ -132,11 +122,7 @@ Free ngrok URLs can change when the agent restarts. If yours changes, update the
           "from": "15551234567",
           "id": "wamid.example",
           "type": "audio",
-          "audio": {
-            "id": "META_MEDIA_ID",
-            "mime_type": "audio/ogg; codecs=opus",
-            "voice": true
-          }
+          "audio": {"id": "META_MEDIA_ID", "mime_type": "audio/ogg", "voice": true}
         }]
       }
     }]
@@ -144,39 +130,45 @@ Free ngrok URLs can change when the agent restarts. If yours changes, update the
 }
 ```
 
-A successful ingestion/download returns:
+Immediate acknowledgement:
 
 ```json
 {
   "status": "accepted",
   "shipments_created": 1,
   "duplicates": 0,
-  "media_downloaded": 1,
+  "processing_queued": 1,
+  "media_downloaded": 0,
   "failed": 0
 }
 ```
 
-Malformed, status-only, and non-audio payloads return `status: ignored`. Media failures still return HTTP 200 with `failed: 1` after recording the shipment as `FAILED`; this prevents repeated webhook delivery from creating a retry storm.
+`media_downloaded` is retained for response compatibility but is `0` because download now happens after acknowledgement. Inspect the Shipment row or logs for the background outcome. Missing media IDs are failed during ingestion; provider failures are recorded later in `media_error` or `processing_error`. A repeated stable Meta message ID returns `duplicates: 1` and schedules no work.
 
-## Tests
+## ngrok demo
+
+With Uvicorn running on port 8000:
 
 ```bash
-pytest
+ngrok config add-authtoken YOUR_NGROK_AUTHTOKEN
+ngrok http 8000
 ```
 
-The suite uses isolated SQLite files and mocked Meta HTTP calls. It does not require real credentials or internet access.
+In **Meta App Dashboard → WhatsApp → Configuration → Webhooks** set:
 
-## Logs and media cleanup
+- Callback URL: `https://YOUR-NGROK-DOMAIN/meta-webhook`
+- Verify token: exactly the value in `META_WEBHOOK_VERIFY_TOKEN`
+- Subscription field: `messages`
 
-Application logs contain event names, message/media IDs, internal user/shipment IDs, and sanitized failure reasons. They intentionally omit tokens, authentication headers, signed download URLs, and full payloads.
+Free ngrok URLs usually change after restart, so update Meta when the forwarding URL changes.
 
-Downloads use generated filenames, stream through `.part` files, validate both the `audio/ogg` content type and Ogg container header, enforce the configured size limit, and remove partial/orphan files after failure. Completed files are not automatically deleted because later phases still need them. For a demo, clear only known `shipment-*.ogg` files after they are no longer needed.
+## Operational notes and limitations
 
-## Current limitations
-
-- Media download is synchronous and adds latency to the webhook response.
-- Failed downloads require a future manual retry mechanism.
-- Completed files in `/tmp` are ephemeral and have no retention job.
-- POST webhook signature verification using the Meta app secret is not implemented yet.
-- Audio is accepted only when Meta returns `audio/ogg`; no transcoding is performed.
-- AI, transcription, background workers, and production migrations are outside Phase 1.
+- FastAPI `BackgroundTasks` is intentionally used for the hackathon MVP. Work is in-process and is not durable across a server crash or restart.
+- SQLite is suitable for the demo, not high write concurrency.
+- Downloaded files in `/tmp` are ephemeral and have no automatic retention job. Generated filenames prevent path traversal; failed partial files are removed.
+- Only `audio/ogg` with an Ogg container header is accepted. There is no transcoding.
+- Meta POST signature verification is not yet implemented.
+- Failed jobs do not have an automatic retry endpoint.
+- The document OCR adapter needs a deployment-specific `INDICOCR_API_URL`. Phase 2 defines a Vision-provider interface but does not ship a concrete Sarvam Vision adapter.
+- Unit and integration tests mock all external APIs and do not require live credentials.

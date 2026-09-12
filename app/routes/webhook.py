@@ -4,7 +4,7 @@ import logging
 from secrets import compare_digest
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -12,8 +12,8 @@ from sqlalchemy.orm import Session
 from app.config import AppSettings, get_settings
 from app.database import get_db
 from app.schemas import WebhookResponse
-from app.services.meta import MetaMediaService, get_meta_media_service
-from app.services.shipments import ingest_audio_messages
+from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
+from app.services.shipments import persist_audio_messages
 from app.services.webhook import extract_audio_messages
 
 
@@ -55,8 +55,9 @@ def verify_meta_webhook(
 @router.post("/meta-webhook", response_model=WebhookResponse)
 async def receive_meta_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    media_service: MetaMediaService = Depends(get_meta_media_service),
+    task_runner: ShipmentTaskRunner = Depends(get_shipment_task_runner),
 ) -> WebhookResponse:
     """Acknowledge a webhook after persisting any audio messages it contains."""
 
@@ -84,7 +85,7 @@ async def receive_meta_webhook(
         )
 
     try:
-        result = ingest_audio_messages(db, payload, messages, media_service)
+        result = persist_audio_messages(db, payload, messages)
     except SQLAlchemyError as exc:
         db.rollback()
         logger.error("webhook_database_error error_type=%s", type(exc).__name__)
@@ -100,10 +101,13 @@ async def receive_meta_webhook(
             detail="Webhook processing failed.",
         ) from exc
 
+    for shipment_id in result.shipment_ids:
+        background_tasks.add_task(task_runner, shipment_id)
+
     return WebhookResponse(
         status="accepted",
         shipments_created=result.shipments_created,
         duplicates=result.duplicates,
-        media_downloaded=result.media_downloaded,
+        processing_queued=result.processing_queued,
         failed=result.failed,
     )

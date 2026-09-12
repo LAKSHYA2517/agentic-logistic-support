@@ -1,0 +1,11 @@
+[project]
+name = "sauda-ai"
+version = "0.1.0"
+description = "Sauda AI - autonomous WhatsApp logistics ERP"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

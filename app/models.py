@@ -78,6 +78,15 @@ class Shipment(Base):
     raw_event: Mapped[dict[str, Any]] = mapped_column(JSON)
     media_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     media_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    transcript: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extracted_data: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    processing_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    processing_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    processing_completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

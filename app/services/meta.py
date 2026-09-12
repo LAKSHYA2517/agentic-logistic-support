@@ -2,16 +2,12 @@
 
 import os
 import re
-from collections.abc import Generator
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
-
-from app.config import get_settings
-
 
 class MetaMediaError(RuntimeError):
     """A safe-to-store description of a Meta media retrieval failure."""
@@ -167,22 +163,3 @@ def prepare_media_directory(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir() or not os.access(output_dir, os.W_OK):
         raise RuntimeError(f"Media download directory is not writable: {output_dir}")
-
-
-def get_meta_media_service() -> Generator[MetaMediaService, None, None]:
-    """Provide a request-scoped Meta media service and HTTP client."""
-
-    settings = get_settings()
-    with httpx.Client(
-        timeout=settings.meta_request_timeout_seconds,
-        follow_redirects=True,
-    ) as http_client:
-        yield MetaMediaService(
-            access_token=settings.meta_access_token,
-            graph_api_base_url=settings.meta_graph_api_base_url,
-            graph_api_version=settings.meta_api_version,
-            output_dir=settings.media_download_dir,
-            max_media_bytes=settings.media_max_bytes,
-            http_client=http_client,
-            phone_number_id=settings.meta_phone_number_id,
-        )

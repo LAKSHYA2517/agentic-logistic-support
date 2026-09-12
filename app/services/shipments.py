@@ -1,8 +1,7 @@
 """Database-backed orchestration for incoming audio shipments."""
 
 import logging
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -10,7 +9,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Shipment, ShipmentStatus, User, UserRole
-from app.services.meta import MetaMediaError, MetaMediaService
 from app.services.webhook import ParsedMetaMessage
 
 
@@ -23,18 +21,18 @@ class IngestionResult:
 
     shipments_created: int = 0
     duplicates: int = 0
-    media_downloaded: int = 0
+    processing_queued: int = 0
     failed: int = 0
+    shipment_ids: list[int] = field(default_factory=list)
 
 
-def ingest_audio_messages(
+def persist_audio_messages(
     db: Session,
     payload: dict[str, Any],
     messages: list[ParsedMetaMessage],
-    media_service: MetaMediaService,
     default_role: UserRole = UserRole.TRANSPORTER,
 ) -> IngestionResult:
-    """Persist, deduplicate, and retrieve media for parsed audio messages."""
+    """Persist and deduplicate messages before any slow external processing."""
 
     result = IngestionResult()
 
@@ -73,36 +71,8 @@ def ingest_audio_messages(
             )
             result.failed += 1
             continue
-
-        logger.info(
-            "media_download_started shipment_id=%s media_id=%s",
-            shipment.id,
-            message.media_id,
-        )
-        try:
-            media_path = media_service.download_audio(message.media_id, shipment.id)
-        except MetaMediaError as exc:
-            _mark_failed(db, shipment, str(exc))
-            logger.warning(
-                "media_download_failed shipment_id=%s media_id=%s reason=%s",
-                shipment.id,
-                message.media_id,
-                exc,
-            )
-            result.failed += 1
-            continue
-
-        try:
-            _mark_downloaded(db, shipment, media_path)
-        except Exception:
-            media_path.unlink(missing_ok=True)
-            raise
-        logger.info(
-            "media_download_completed shipment_id=%s file_name=%s",
-            shipment.id,
-            media_path.name,
-        )
-        result.media_downloaded += 1
+        result.shipment_ids.append(shipment.id)
+        result.processing_queued += 1
 
     return result
 
@@ -181,17 +151,6 @@ def _find_existing_shipment(
             )
         )
     return None
-
-
-def _mark_downloaded(db: Session, shipment: Shipment, media_path: Path) -> None:
-    shipment.media_path = str(media_path)
-    shipment.media_error = None
-    shipment.status = ShipmentStatus.RECEIVED
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
 
 
 def _mark_failed(db: Session, shipment: Shipment, error_message: str) -> None:

@@ -2,11 +2,11 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import Base
+from app.database import Base, upgrade_local_sqlite_schema
 from app.models import Shipment, ShipmentStatus, User, UserRole
 
 
@@ -49,6 +49,9 @@ def test_create_and_query_user_with_shipment(db_session: Session) -> None:
     assert stored_shipment.status is ShipmentStatus.RECEIVED
     assert stored_shipment.raw_event == raw_event
     assert stored_shipment.media_path is None
+    assert stored_shipment.transcript is None
+    assert stored_shipment.extracted_data is None
+    assert stored_shipment.processing_error is None
     assert stored_shipment.created_at is not None
     assert stored_shipment.updated_at is not None
 
@@ -76,3 +79,29 @@ def test_meta_message_id_must_be_unique_when_present(db_session: Session) -> Non
 
     with pytest.raises(IntegrityError):
         db_session.commit()
+
+
+def test_sqlite_upgrade_adds_intelligence_columns_without_losing_rows(tmp_path: Path) -> None:
+    old_engine = create_engine(f"sqlite:///{tmp_path / 'old-phase1.db'}")
+    with old_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE shipments (id INTEGER PRIMARY KEY, raw_event JSON NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO shipments (id, raw_event) VALUES (1, '{\"kept\": true}')"
+        )
+
+    upgrade_local_sqlite_schema(old_engine)
+
+    columns = {item["name"] for item in inspect(old_engine).get_columns("shipments")}
+    assert {
+        "transcript",
+        "extracted_data",
+        "processing_error",
+        "processing_started_at",
+        "processing_completed_at",
+    } <= columns
+    with old_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT COUNT(*) FROM shipments").scalar() == 1
+
+    old_engine.dispose()
