@@ -125,3 +125,100 @@ def test_send_text_message_network_error_raises():
 
     with pytest.raises(MetaMessagingError):
         service.send_text_message(to="15551234567", body="hi")
+
+
+# ---------------------------------------------------------------------------
+# Development visibility: status code, response body, message ID, errors
+# ---------------------------------------------------------------------------
+
+
+def test_send_text_message_returns_whatsapp_message_id_on_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"messages": [{"id": "wamid.HBgL123"}]})
+
+    service = make_service(handler)
+
+    message_id = service.send_text_message(to="15551234567", body="hi")
+
+    assert message_id == "wamid.HBgL123"
+
+
+def test_send_text_message_returns_none_when_response_has_no_message_id():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    service = make_service(handler)
+
+    assert service.send_text_message(to="15551234567", body="hi") is None
+
+
+def test_successful_send_logs_status_body_and_message_id_without_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"messages": [{"id": "wamid.HBgL123"}]})
+
+    service = make_service(handler)
+    caplog.set_level("INFO")
+
+    service.send_text_message(to="919317708038", body="hi")
+
+    assert "meta_outbound_message_accepted" in caplog.text
+    assert "status=200" in caplog.text
+    assert "wamid.HBgL123" in caplog.text
+    assert "test-access-token" not in caplog.text
+
+
+def test_failed_send_logs_status_body_and_error_code_without_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "Invalid OAuth access token test-access-token",
+                    "type": "OAuthException",
+                    "code": 190,
+                }
+            },
+        )
+
+    service = make_service(handler)
+    caplog.set_level("ERROR")
+
+    with pytest.raises(MetaMessagingError) as exc_info:
+        service.send_text_message(to="919317708038", body="hi")
+
+    assert "meta_outbound_message_rejected" in caplog.text
+    assert "status=401" in caplog.text
+    assert '"code":190' in caplog.text
+    assert "test-access-token" not in caplog.text
+    assert "code=190" in str(exc_info.value)
+
+
+def test_recipient_without_country_code_logs_warning_but_still_sends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"messages": [{"id": "wamid.sent"}]})
+
+    service = make_service(handler)
+    caplog.set_level("WARNING")
+
+    service.send_text_message(to="9317708038", body="hi")
+
+    assert "meta_outbound_recipient_format_suspect" in caplog.text
+    assert "looks_like_missing_country_code" in caplog.text
+
+
+def test_recipient_with_country_code_does_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"messages": [{"id": "wamid.sent"}]})
+
+    service = make_service(handler)
+    caplog.set_level("WARNING")
+
+    service.send_text_message(to="919317708038", body="hi")
+
+    assert "meta_outbound_recipient_format_suspect" not in caplog.text

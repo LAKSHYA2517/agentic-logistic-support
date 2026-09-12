@@ -30,29 +30,41 @@ _DEMO_DRIVERS: tuple[tuple[str, str, str], ...] = (
 
 
 def seed_demo_drivers(session: Session, settings: AppSettings) -> int:
-    """Insert any configured demo drivers that are not already present.
+    """Insert or update the configured demo drivers.
 
     A driver in ``_DEMO_DRIVERS`` is skipped (not an error) when its
     settings attribute has no configured phone number -- only the
-    drivers you actually intend to demo with need a real number. Safe
-    to call on every startup: matches on phone number, so re-running
-    never creates duplicates.
+    drivers you actually intend to demo with need a real number.
+
+    Matches on ``truck_number`` (each demo driver's stable identity in
+    ``_DEMO_DRIVERS``), not phone number: a demo operator changing a
+    driver's phone in ``.env`` between restarts (e.g. swapping in a
+    different teammate's number) must update the existing row, not
+    attempt a second INSERT that collides with the truck_number's
+    unique constraint. Safe to call on every startup either way.
     """
     created = 0
+    updated = 0
     for name, truck_number, phone_setting in _DEMO_DRIVERS:
         phone = getattr(settings, phone_setting, None)
         if not phone:
             continue
 
-        existing = session.scalar(select(Driver).where(Driver.phone == phone))
+        canonical_truck_number = normalize_truck_number(truck_number) or truck_number
+        existing = session.scalar(
+            select(Driver).where(Driver.truck_number == canonical_truck_number)
+        )
         if existing is not None:
+            if existing.phone != phone or existing.name != name:
+                existing.phone = phone
+                existing.name = name
+                updated += 1
             continue
 
-        canonical_truck_number = normalize_truck_number(truck_number) or truck_number
         session.add(Driver(name=name, phone=phone, truck_number=canonical_truck_number))
         created += 1
 
-    if created:
+    if created or updated:
         session.commit()
-        logger.info("demo_drivers_seeded count=%s", created)
+        logger.info("demo_drivers_seeded created=%s updated=%s", created, updated)
     return created

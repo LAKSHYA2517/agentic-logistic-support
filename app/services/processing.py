@@ -136,8 +136,15 @@ class ShipmentTaskRunner:
                 http_client=http_client,
             )
             try:
-                service.send_text_message(to=assignment.driver.phone, body=assignment.message)
+                whatsapp_message_id = service.send_text_message(
+                    to=assignment.driver.phone, body=assignment.message
+                )
             except MetaMessagingError as exc:
+                # send_text_message raises for anything that isn't a 2xx
+                # response (or a request-level failure), so reaching this
+                # branch means the message is NOT confirmed sent -- the
+                # detailed status/body/error were already logged inside
+                # MetaMessagingService itself.
                 logger.warning(
                     "driver_message_send_failed driver_id=%s truck_number=%s reason=%s",
                     assignment.driver.id,
@@ -146,10 +153,13 @@ class ShipmentTaskRunner:
                 )
                 return
 
+        # Reached only when send_text_message returned normally, i.e. Meta
+        # actually responded 2xx -- never log this on a failed/uncertain send.
         logger.info(
-            "driver_message_sent driver_id=%s driver_phone=%s",
+            "driver_message_sent driver_id=%s driver_phone=%s whatsapp_message_id=%s",
             assignment.driver.id,
             assignment.driver.phone,
+            whatsapp_message_id,
         )
 
     def _download_and_persist(self, shipment_id: int) -> bool:
