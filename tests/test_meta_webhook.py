@@ -1,0 +1,448 @@
+from collections.abc import Generator
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.config import AppSettings, get_settings
+from app.database import Base, get_db
+from app.main import app
+from app.models import Shipment, ShipmentStatus, User, UserRole
+from app.services.meta import MetaMediaService, get_meta_media_service
+from app.services.webhook import extract_audio_messages
+
+
+@pytest.fixture
+def webhook_client(
+    tmp_path: Path,
+) -> Generator[tuple[TestClient, sessionmaker, list[httpx.Request]], None, None]:
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'webhook-test.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    testing_session_factory = sessionmaker(
+        bind=test_engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    Base.metadata.create_all(test_engine)
+    meta_requests: list[httpx.Request] = []
+
+    def meta_handler(request: httpx.Request) -> httpx.Response:
+        meta_requests.append(request)
+        assert request.headers["authorization"] == "Bearer test-access-token"
+
+        if request.url.host == "graph.test":
+            assert request.url.params["phone_number_id"] == "test-phone-number-id"
+            media_id = request.url.path.rsplit("/", maxsplit=1)[-1]
+            assert request.url.path == f"/v25.0/{media_id}"
+            if media_id == "media-fail":
+                return httpx.Response(
+                    503,
+                    json={
+                        "error": {
+                            "message": (
+                                "Temporary failure for test-access-token. "
+                                "See https://example.test/error?token=secret"
+                            ),
+                            "type": "GraphMethodException",
+                            "code": 100,
+                            "error_subcode": 33,
+                        }
+                    },
+                )
+            if media_id == "network-error":
+                raise httpx.ConnectError("mock connection failed", request=request)
+            if media_id == "invalid-json":
+                return httpx.Response(200, content=b"not-json")
+            if media_id == "missing-url":
+                return httpx.Response(200, json={"id": media_id})
+            return httpx.Response(
+                200,
+                json={"url": f"https://media.test/download/{media_id}"},
+            )
+
+        if request.url.host == "media.test":
+            media_id = request.url.path.rsplit("/", maxsplit=1)[-1]
+            if media_id == "download-fail":
+                return httpx.Response(502)
+            if media_id == "empty-file":
+                return httpx.Response(
+                    200,
+                    content=b"",
+                    headers={"content-type": "audio/ogg"},
+                )
+            if media_id == "wrong-type":
+                return httpx.Response(
+                    200,
+                    content=b"not audio",
+                    headers={"content-type": "text/plain"},
+                )
+            if media_id == "invalid-ogg":
+                return httpx.Response(
+                    200,
+                    content=b"this-is-not-an-ogg-file",
+                    headers={"content-type": "audio/ogg"},
+                )
+            if media_id == "too-large":
+                return httpx.Response(
+                    200,
+                    content=b"OggS" + (b"x" * 100),
+                    headers={"content-type": "audio/ogg"},
+                )
+            return httpx.Response(
+                200,
+                content=b"OggS\x00mock-opus-audio",
+                headers={"content-type": "audio/ogg"},
+            )
+
+        return httpx.Response(404)
+
+    meta_http_client = httpx.Client(
+        transport=httpx.MockTransport(meta_handler),
+        follow_redirects=True,
+    )
+    media_service = MetaMediaService(
+        access_token="test-access-token",
+        graph_api_base_url="https://graph.test",
+        graph_api_version="v25.0",
+        output_dir=tmp_path / "media",
+        max_media_bytes=64,
+        http_client=meta_http_client,
+        phone_number_id="test-phone-number-id",
+    )
+
+    def override_get_db() -> Generator[Session, None, None]:
+        with testing_session_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_meta_media_service] = lambda: media_service
+    app.dependency_overrides[get_settings] = lambda: AppSettings(
+        meta_webhook_verify_token="demo-verify-token"
+    )
+    with TestClient(app) as client:
+        yield client, testing_session_factory, meta_requests
+    app.dependency_overrides.clear()
+    meta_http_client.close()
+    test_engine.dispose()
+
+
+def _audio_payload(
+    sender: str = "919876543210",
+    message_id: str = "wamid.example",
+    media_id: str = "media-123",
+) -> dict[str, Any]:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "business-account-id",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "messaging_product": "whatsapp",
+                            "contacts": [{"wa_id": sender, "profile": {"name": "Driver"}}],
+                            "messages": [
+                                {
+                                    "from": sender,
+                                    "id": message_id,
+                                    "timestamp": "1720000000",
+                                    "type": "audio",
+                                    "audio": {
+                                        "id": media_id,
+                                        "mime_type": "audio/ogg; codecs=opus",
+                                        "voice": True,
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_valid_audio_webhook_is_parsed_and_persisted(
+    webhook_client: tuple, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, session_factory, meta_requests = webhook_client
+    payload = _audio_payload()
+    caplog.set_level("INFO", logger="app")
+
+    parsed = extract_audio_messages(payload)
+    response = client.post("/meta-webhook", json=payload)
+
+    assert parsed[0].sender_number == "919876543210"
+    assert parsed[0].message_id == "wamid.example"
+    assert parsed[0].media_id == "media-123"
+    assert parsed[0].message_type == "audio"
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "accepted",
+        "shipments_created": 1,
+        "duplicates": 0,
+        "media_downloaded": 1,
+        "failed": 0,
+    }
+    assert len(meta_requests) == 2
+    assert "webhook_received" in caplog.text
+    assert "shipment_created" in caplog.text
+    assert "media_download_started" in caplog.text
+    assert "media_download_completed" in caplog.text
+    assert "test-access-token" not in caplog.text
+
+    with session_factory() as session:
+        user = session.scalar(select(User))
+        shipment = session.scalar(select(Shipment))
+
+        assert user is not None
+        assert user.whatsapp_number == "919876543210"
+        assert user.role is UserRole.TRANSPORTER
+        assert shipment is not None
+        assert shipment.user_id == user.id
+        assert shipment.status is ShipmentStatus.RECEIVED
+        assert shipment.media_id == "media-123"
+        assert shipment.message_id == "wamid.example"
+        assert shipment.message_type == "audio"
+        assert shipment.media_path is not None
+        assert Path(shipment.media_path).suffix == ".ogg"
+        assert Path(shipment.media_path).read_bytes() == b"OggS\x00mock-opus-audio"
+        assert shipment.media_error is None
+        assert shipment.raw_event == payload
+
+
+def test_missing_optional_message_fields_are_safe(webhook_client: tuple) -> None:
+    client, session_factory, meta_requests = webhook_client
+    payload = {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "contacts": [{"wa_id": "441234567890"}],
+                            "messages": [{"audio": {}}],
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    parsed = extract_audio_messages(payload)
+    response = client.post("/meta-webhook", json=payload)
+
+    assert parsed[0].sender_number == "441234567890"
+    assert parsed[0].message_id is None
+    assert parsed[0].media_id is None
+    assert parsed[0].message_type == "audio"
+    assert response.json() == {
+        "status": "accepted",
+        "shipments_created": 1,
+        "duplicates": 0,
+        "media_downloaded": 0,
+        "failed": 1,
+    }
+    assert meta_requests == []
+
+    with session_factory() as session:
+        shipment = session.scalar(select(Shipment))
+        assert shipment is not None
+        assert shipment.media_id is None
+        assert shipment.media_path is None
+        assert shipment.status is ShipmentStatus.FAILED
+        assert shipment.media_error == "Audio message did not include a media ID."
+
+
+def test_irrelevant_and_malformed_payloads_are_ignored(webhook_client: tuple) -> None:
+    client, session_factory, meta_requests = webhook_client
+    status_payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{"changes": [{"value": {"statuses": [{"status": "read"}]}}]}],
+    }
+
+    responses = [
+        client.post("/meta-webhook", json={}),
+        client.post("/meta-webhook", json=status_payload),
+        client.post(
+            "/meta-webhook",
+            content="not-json",
+            headers={"content-type": "application/json"},
+        ),
+    ]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(
+        response.json()
+        == {
+            "status": "ignored",
+            "shipments_created": 0,
+            "duplicates": 0,
+            "media_downloaded": 0,
+            "failed": 0,
+        }
+        for response in responses
+    )
+    assert meta_requests == []
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(User)) == 0
+        assert session.scalar(select(func.count()).select_from(Shipment)) == 0
+
+
+def test_existing_user_is_reused(webhook_client: tuple) -> None:
+    client, session_factory, meta_requests = webhook_client
+
+    first_response = client.post("/meta-webhook", json=_audio_payload())
+    second_response = client.post(
+        "/meta-webhook",
+        json=_audio_payload(message_id="wamid.second", media_id="media-456"),
+    )
+    duplicate_response = client.post("/meta-webhook", json=_audio_payload())
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert duplicate_response.json() == {
+        "status": "accepted",
+        "shipments_created": 0,
+        "duplicates": 1,
+        "media_downloaded": 0,
+        "failed": 0,
+    }
+    assert len(meta_requests) == 4
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(User)) == 1
+        assert session.scalar(select(func.count()).select_from(Shipment)) == 2
+
+
+def test_media_download_failure_marks_shipment_failed(
+    webhook_client: tuple, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, session_factory, meta_requests = webhook_client
+    payload = _audio_payload(message_id="wamid.failure", media_id="media-fail")
+    caplog.set_level("WARNING", logger="app")
+
+    response = client.post("/meta-webhook", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "accepted",
+        "shipments_created": 1,
+        "duplicates": 0,
+        "media_downloaded": 0,
+        "failed": 1,
+    }
+    assert len(meta_requests) == 1
+    with session_factory() as session:
+        shipment = session.scalar(select(Shipment))
+        assert shipment is not None
+        assert shipment.status is ShipmentStatus.FAILED
+        assert shipment.media_path is None
+        assert shipment.media_error == (
+            "Meta media lookup failed with HTTP 503 (code=100, subcode=33): "
+            "Temporary failure for <redacted>. See <url>"
+        )
+        assert shipment.raw_event == payload
+    assert "Temporary failure for <redacted>. See <url>" in caplog.text
+    assert "test-access-token" not in caplog.text
+    assert "token=secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("media_id", "expected_error", "expected_requests"),
+    [
+        ("invalid-json", "Meta media lookup returned invalid JSON.", 1),
+        ("missing-url", "Meta media lookup response did not include a URL.", 1),
+        ("network-error", "Meta media lookup request failed.", 1),
+        ("download-fail", "Meta media download failed with HTTP 502.", 2),
+        ("empty-file", "Meta media download returned an empty file.", 2),
+        ("wrong-type", "Meta media download was not audio/ogg.", 2),
+        ("invalid-ogg", "Meta media download was not a valid Ogg file.", 2),
+        (
+            "too-large",
+            "Meta media download exceeded the configured size limit.",
+            2,
+        ),
+    ],
+)
+def test_media_failure_cases_are_recorded_safely(
+    webhook_client: tuple,
+    media_id: str,
+    expected_error: str,
+    expected_requests: int,
+) -> None:
+    client, session_factory, meta_requests = webhook_client
+
+    response = client.post(
+        "/meta-webhook",
+        json=_audio_payload(message_id=f"wamid.{media_id}", media_id=media_id),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["failed"] == 1
+    assert len(meta_requests) == expected_requests
+    with session_factory() as session:
+        shipment = session.scalar(select(Shipment))
+        assert shipment is not None
+        assert shipment.status is ShipmentStatus.FAILED
+        assert shipment.media_path is None
+        assert shipment.media_error == expected_error
+
+
+def test_meta_webhook_verification_succeeds(webhook_client: tuple) -> None:
+    client, _, _ = webhook_client
+
+    response = client.get(
+        "/meta-webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "demo-verify-token",
+            "hub.challenge": "challenge-value-123",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text == "challenge-value-123"
+    assert response.headers["content-type"].startswith("text/plain")
+
+
+def test_meta_webhook_verification_rejects_wrong_token(webhook_client: tuple) -> None:
+    client, _, _ = webhook_client
+
+    response = client.get(
+        "/meta-webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "wrong-token",
+            "hub.challenge": "challenge-value-123",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Webhook verification failed."}
+
+
+def test_meta_webhook_verification_requires_configuration(
+    webhook_client: tuple,
+) -> None:
+    client, _, _ = webhook_client
+    app.dependency_overrides[get_settings] = lambda: AppSettings(
+        meta_webhook_verify_token=None
+    )
+
+    response = client.get(
+        "/meta-webhook",
+        params={
+            "hub.mode": "subscribe",
+            "hub.verify_token": "anything",
+            "hub.challenge": "challenge-value-123",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Webhook verification is not configured."}
