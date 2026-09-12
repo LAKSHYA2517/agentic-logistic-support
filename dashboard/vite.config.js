@@ -11,5 +11,13 @@ export default defineConfig({
   server: {
     port: 5173,
     open: false,
+    proxy: {
+      // Forward dashboard API calls to the FastAPI backend so the
+      // frontend never needs to hardcode its origin.
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
+    },
   },
 })

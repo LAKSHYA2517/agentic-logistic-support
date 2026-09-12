@@ -5,10 +5,12 @@ from collections.abc import AsyncIterator
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import SessionLocal, init_db
 from app.logging_config import configure_logging
+from app.routes.dashboard import router as dashboard_router
 from app.routes.webhook import router as webhook_router
 from app.schemas import HealthResponse
 from app.seed import seed_demo_drivers
@@ -31,7 +33,19 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title=settings.name, debug=settings.debug, lifespan=lifespan)
+
+# Allow the Vite dev server (dashboard/) to call the API from a
+# different origin. Local dev only -- not a secret, so a fixed
+# allow-list is fine rather than new configuration surface.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 app.include_router(webhook_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["health"])

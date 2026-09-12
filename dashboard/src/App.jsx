@@ -1,7 +1,16 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useWebSocket } from './hooks/useWebSocket';
 import { Dashboard } from './components/Dashboard';
 import { INITIAL_MOCK_SHIPMENTS } from './utils/constants';
+
+// How often to refetch real shipment state from the backend. The
+// backend has no WebSocket/SSE push channel yet, so a short-interval
+// refetch is the simplest way to reflect seller/driver WhatsApp
+// activity without standing up new infrastructure (see useWebSocket,
+// which stays wired to ws://localhost:8000/ws for the existing
+// simulator/demo path and simply shows "disconnected" if nothing is
+// listening there -- harmless).
+const SHIPMENTS_POLL_INTERVAL_MS = 4000;
 
 function App() {
   const [shipments, setShipments] = useState(() => {
@@ -126,6 +135,61 @@ function App() {
 
     triggerHighlight(normalizedShipment.id);
   }, [triggerHighlight]);
+
+  // Mirrors `shipments` so the poller below can compare against current
+  // state without depending on (and re-subscribing on) `shipments` itself.
+  const shipmentsRef = useRef(shipments);
+  useEffect(() => {
+    shipmentsRef.current = shipments;
+  }, [shipments]);
+
+  // Poll the real backend for shipment state. Only shipments that are
+  // new or actually changed are pushed through handleIncomingPayload --
+  // this both reuses its existing upsert/highlight logic as-is and
+  // avoids flashing every row on every poll tick when nothing changed.
+  // Locally-simulated demo shipments (from the Voice Simulator) are
+  // never touched here, since this only ever upserts backend-known
+  // ids, never replaces the whole list.
+  const fetchShipmentsFromBackend = useCallback(async () => {
+    let response;
+    try {
+      response = await fetch('/api/shipments');
+    } catch (e) {
+      return; // backend unreachable this cycle -- retry next interval
+    }
+    if (!response.ok) return;
+
+    let backendShipments;
+    try {
+      backendShipments = await response.json();
+    } catch (e) {
+      return;
+    }
+    if (!Array.isArray(backendShipments)) return;
+
+    for (const raw of backendShipments) {
+      if (!raw || !raw.id) continue;
+      const previous = shipmentsRef.current.find((s) => s.id === raw.id);
+      const changed =
+        !previous ||
+        previous.status !== raw.status ||
+        previous.party_name !== raw.party_name ||
+        previous.truck_number !== raw.truck_number ||
+        previous.destination !== raw.destination ||
+        Number(previous.advance_paid) !== Number(raw.advance_paid) ||
+        Number(previous.balance_due) !== Number(raw.balance_due);
+
+      if (changed) {
+        handleIncomingPayload(raw);
+      }
+    }
+  }, [handleIncomingPayload]);
+
+  useEffect(() => {
+    fetchShipmentsFromBackend();
+    const intervalId = setInterval(fetchShipmentsFromBackend, SHIPMENTS_POLL_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [fetchShipmentsFromBackend]);
 
   // WebSocket hook with auto reconnection & native browser WebSocket
   const {
