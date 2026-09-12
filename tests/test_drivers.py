@@ -10,6 +10,7 @@ from app.models import Driver, DriverConfirmationStatus, Shipment, ShipmentStatu
 from app.services.drivers import (
     assign_driver_for_shipment,
     build_assignment_message,
+    build_assignment_template_parameters,
     find_driver_by_truck_number,
 )
 
@@ -121,6 +122,29 @@ def test_build_assignment_message_handles_missing_amounts(db_session: Session):
     assert "Destination: Unknown" in message
     assert "Advance: not stated" in message
     assert "Balance: not stated" in message
+
+
+def test_build_assignment_template_parameters_match_approved_template_order(
+    db_session: Session,
+):
+    shipment = _accepted_shipment(
+        db_session,
+        {
+            "party_name": "Ramesh Traders",
+            "truck_number": "RJ14GB1122",
+            "destination": "Delhi",
+            "advance_paid": 10000,
+            "balance_due": 25000,
+        },
+    )
+
+    assert build_assignment_template_parameters(shipment) == (
+        "Ramesh Traders",
+        "RJ14GB1122",
+        "Delhi",
+        "₹10,000",
+        "₹25,000",
+    )
 
 
 # ---------------------------------------------------------------------------

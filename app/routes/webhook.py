@@ -11,11 +11,17 @@ from sqlalchemy.orm import Session
 
 from app.config import AppSettings, get_settings
 from app.database import get_db
+from app.intelligence.http_support import sanitize_provider_message
 from app.schemas import WebhookResponse
 from app.services.driver_replies import process_driver_replies
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
 from app.services.shipments import persist_audio_messages
-from app.services.webhook import extract_audio_messages, extract_text_messages
+from app.services.webhook import (
+    ParsedMessageStatus,
+    extract_audio_messages,
+    extract_message_statuses,
+    extract_text_messages,
+)
 
 
 router = APIRouter(tags=["meta-webhook"])
@@ -75,10 +81,17 @@ async def receive_meta_webhook(
 
     audio_messages = extract_audio_messages(payload)
     text_messages = extract_text_messages(payload)
+    message_statuses = extract_message_statuses(payload)
 
-    if not audio_messages and not text_messages:
+    for message_status in message_statuses:
+        _log_message_status(message_status)
+
+    if not audio_messages and not text_messages and not message_statuses:
         logger.info("webhook_ignored reason=no_recognized_messages")
         return WebhookResponse(status="ignored")
+
+    if message_statuses and not audio_messages and not text_messages:
+        return WebhookResponse(status="accepted")
 
     driver_confirmed = 0
     driver_rejected = 0
@@ -137,4 +150,36 @@ async def receive_meta_webhook(
         failed=result.failed,
         driver_confirmed=driver_confirmed,
         driver_rejected=driver_rejected,
+    )
+
+
+def _log_message_status(message_status: ParsedMessageStatus) -> None:
+    """Log Meta's actual outbound delivery result without dumping the payload."""
+
+    if message_status.status != "failed":
+        logger.info(
+            "meta_outbound_delivery_status message_id=%s status=%s recipient=%s",
+            message_status.message_id,
+            message_status.status,
+            message_status.recipient_id,
+        )
+        return
+
+    errors = []
+    for error in message_status.errors:
+        parts = []
+        if error.code is not None:
+            parts.append(f"code={error.code}")
+        if error.message:
+            parts.append(f"message={sanitize_provider_message(error.message)}")
+        if error.details:
+            parts.append(f"details={sanitize_provider_message(error.details)}")
+        if parts:
+            errors.append(", ".join(parts))
+
+    logger.error(
+        "meta_outbound_delivery_failed message_id=%s recipient=%s error=%s",
+        message_status.message_id,
+        message_status.recipient_id,
+        "; ".join(errors) or "Meta did not provide error details",
     )

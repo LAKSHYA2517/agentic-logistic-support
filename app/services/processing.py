@@ -134,10 +134,14 @@ class ShipmentTaskRunner:
                 graph_api_version=self._settings.meta_api_version,
                 phone_number_id=self._settings.meta_phone_number_id,
                 http_client=http_client,
+                driver_template_name=self._settings.meta_driver_template_name,
+                driver_template_language=self._settings.meta_driver_template_language,
             )
             try:
-                whatsapp_message_id = service.send_text_message(
-                    to=assignment.driver.phone, body=assignment.message
+                whatsapp_message_id = service.send_driver_assignment(
+                    to=assignment.driver.phone,
+                    text_body=assignment.message,
+                    template_parameters=assignment.template_parameters,
                 )
             except MetaMessagingError as exc:
                 # send_text_message raises for anything that isn't a 2xx
@@ -153,10 +157,10 @@ class ShipmentTaskRunner:
                 )
                 return
 
-        # Reached only when send_text_message returned normally, i.e. Meta
-        # actually responded 2xx -- never log this on a failed/uncertain send.
+        # A 2xx confirms API acceptance only. Delivery is reported later through
+        # the status webhook handled by app.routes.webhook.
         logger.info(
-            "driver_message_sent driver_id=%s driver_phone=%s whatsapp_message_id=%s",
+            "driver_message_accepted driver_id=%s driver_phone=%s whatsapp_message_id=%s",
             assignment.driver.id,
             assignment.driver.phone,
             whatsapp_message_id,

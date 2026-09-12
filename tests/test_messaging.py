@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -31,8 +33,6 @@ def test_send_text_message_uses_correct_url_headers_and_body():
 
     assert captured["url"] == "https://graph.test/v25.0/test-phone-number-id/messages"
     assert captured["headers"]["authorization"] == "Bearer test-access-token"
-    import json
-
     body = json.loads(captured["body"])
     assert body == {
         "messaging_product": "whatsapp",
@@ -40,6 +40,74 @@ def test_send_text_message_uses_correct_url_headers_and_body():
         "type": "text",
         "text": {"body": "New shipment assigned."},
     }
+
+
+def test_driver_assignment_uses_configured_utility_template():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read())
+        return httpx.Response(200, json={"messages": [{"id": "wamid.template"}]})
+
+    service = make_service(
+        handler,
+        driver_template_name="driver_shipment_assignment",
+        driver_template_language="en_US",
+    )
+
+    message_id = service.send_driver_assignment(
+        to="919317708038",
+        text_body="fallback text",
+        template_parameters=(
+            "Ramesh Traders",
+            "RJ14GB1122",
+            "Delhi",
+            "₹10,000",
+            "₹25,000",
+        ),
+    )
+
+    assert message_id == "wamid.template"
+    assert captured["body"] == {
+        "messaging_product": "whatsapp",
+        "to": "919317708038",
+        "type": "template",
+        "template": {
+            "name": "driver_shipment_assignment",
+            "language": {"code": "en_US"},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": "Ramesh Traders"},
+                        {"type": "text", "text": "RJ14GB1122"},
+                        {"type": "text", "text": "Delhi"},
+                        {"type": "text", "text": "₹10,000"},
+                        {"type": "text", "text": "₹25,000"},
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def test_driver_assignment_without_template_uses_free_form_text():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read())
+        return httpx.Response(200, json={"messages": [{"id": "wamid.text"}]})
+
+    service = make_service(handler)
+
+    service.send_driver_assignment(
+        to="919317708038",
+        text_body="New shipment assigned.",
+        template_parameters=("unused",),
+    )
+
+    assert captured["body"]["type"] == "text"
+    assert captured["body"]["text"]["body"] == "New shipment assigned."
 
 
 def test_send_text_message_missing_access_token_raises_without_request():

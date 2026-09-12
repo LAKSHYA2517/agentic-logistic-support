@@ -8,6 +8,8 @@ def test_meta_ids_and_api_version_are_loaded_from_expected_environment_names(
     monkeypatch.setenv("META_PHONE_NUMBER_ID", "phone-number-id")
     monkeypatch.setenv("META_API_VERSION", "v99.0")
     monkeypatch.setenv("META_ACCESS_TOKEN", "environment-token")
+    monkeypatch.setenv("META_DRIVER_TEMPLATE_NAME", "driver_assignment")
+    monkeypatch.setenv("META_DRIVER_TEMPLATE_LANGUAGE", "en_US")
 
     settings = AppSettings()
 
@@ -15,6 +17,8 @@ def test_meta_ids_and_api_version_are_loaded_from_expected_environment_names(
     assert settings.meta_phone_number_id == "phone-number-id"
     assert settings.meta_api_version == "v99.0"
     assert settings.meta_access_token == "environment-token"
+    assert settings.meta_driver_template_name == "driver_assignment"
+    assert settings.meta_driver_template_language == "en_US"
 
 
 def test_intelligence_settings_use_the_shared_application_config(monkeypatch) -> None:

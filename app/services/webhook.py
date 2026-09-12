@@ -23,6 +23,71 @@ class ParsedTextMessage:
     text_body: str
 
 
+@dataclass(frozen=True)
+class ParsedStatusError:
+    """Sanitized fields Meta supplies for one outbound delivery failure."""
+
+    code: Optional[int]
+    message: Optional[str]
+    details: Optional[str]
+
+
+@dataclass(frozen=True)
+class ParsedMessageStatus:
+    """Delivery state for one outbound WhatsApp message."""
+
+    message_id: str
+    status: str
+    recipient_id: Optional[str]
+    errors: tuple[ParsedStatusError, ...]
+
+
+def extract_message_statuses(payload: dict[str, Any]) -> list[ParsedMessageStatus]:
+    """Extract sent/delivered/read/failed callbacks from a Meta envelope."""
+
+    extracted: list[ParsedMessageStatus] = []
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+            for item in _dict_items(value.get("statuses")):
+                message_id = _optional_string(item.get("id"))
+                message_status = _optional_string(item.get("status"))
+                if message_id is None or message_status is None:
+                    continue
+
+                errors: list[ParsedStatusError] = []
+                for error in _dict_items(item.get("errors")):
+                    error_data = error.get("error_data")
+                    details = (
+                        _optional_string(error_data.get("details"))
+                        if isinstance(error_data, dict)
+                        else None
+                    )
+                    code = error.get("code")
+                    errors.append(
+                        ParsedStatusError(
+                            code=code if isinstance(code, int) else None,
+                            message=(
+                                _optional_string(error.get("message"))
+                                or _optional_string(error.get("title"))
+                            ),
+                            details=details,
+                        )
+                    )
+
+                extracted.append(
+                    ParsedMessageStatus(
+                        message_id=message_id,
+                        status=message_status.lower(),
+                        recipient_id=_optional_string(item.get("recipient_id")),
+                        errors=tuple(errors),
+                    )
+                )
+    return extracted
+
+
 def extract_text_messages(payload: dict[str, Any]) -> list[ParsedTextMessage]:
     """Extract plain-text messages while tolerating missing/unexpected fields.
 

@@ -59,6 +59,12 @@ class AppSettings(BaseModel):
     meta_phone_number_id: Optional[str] = Field(
         default_factory=lambda: os.getenv("META_PHONE_NUMBER_ID") or None
     )
+    meta_driver_template_name: Optional[str] = Field(
+        default_factory=lambda: os.getenv("META_DRIVER_TEMPLATE_NAME") or None
+    )
+    meta_driver_template_language: str = Field(
+        default_factory=lambda: os.getenv("META_DRIVER_TEMPLATE_LANGUAGE", "en_US")
+    )
     meta_request_timeout_seconds: float = Field(
         default_factory=lambda: float(os.getenv("META_REQUEST_TIMEOUT_SECONDS", "20")),
         gt=0,

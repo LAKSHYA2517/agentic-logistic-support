@@ -32,6 +32,7 @@ class DriverAssignment:
 
     driver: Driver
     message: str
+    template_parameters: tuple[str, ...]
 
 
 def find_driver_by_truck_number(db: Session, truck_number: str) -> Optional[Driver]:
@@ -60,6 +61,19 @@ def build_assignment_message(shipment: Shipment) -> str:
         f"New shipment assigned. Party: {party}, Truck: {truck}, "
         f"Destination: {destination}, Advance: {_format_currency(data.get('advance_paid'))}, "
         f"Balance: {_format_currency(data.get('balance_due'))}. Please confirm YES or NO."
+    )
+
+
+def build_assignment_template_parameters(shipment: Shipment) -> tuple[str, ...]:
+    """Return values in the order required by the driver utility template."""
+
+    data = shipment.extracted_data or {}
+    return (
+        str(data.get("party_name") or "Unknown party"),
+        str(data.get("truck_number") or "Unknown"),
+        str(data.get("destination") or "Unknown"),
+        _format_currency(data.get("advance_paid")),
+        _format_currency(data.get("balance_due")),
     )
 
 
@@ -135,4 +149,8 @@ def assign_driver_for_shipment(db: Session, shipment_id: int) -> Optional[Driver
         driver.id,
         truck_number,
     )
-    return DriverAssignment(driver=driver, message=message)
+    return DriverAssignment(
+        driver=driver,
+        message=message,
+        template_parameters=build_assignment_template_parameters(shipment),
+    )

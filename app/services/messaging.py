@@ -44,12 +44,16 @@ class MetaMessagingService:
         graph_api_version: str,
         phone_number_id: Optional[str],
         http_client: httpx.Client,
+        driver_template_name: Optional[str] = None,
+        driver_template_language: str = "en_US",
     ) -> None:
         self._access_token = access_token
         self._base_url = graph_api_base_url.rstrip("/")
         self._version = graph_api_version.strip("/")
         self._phone_number_id = phone_number_id
         self._client = http_client
+        self._driver_template_name = driver_template_name
+        self._driver_template_language = driver_template_language
 
     def send_text_message(self, *, to: str, body: str) -> Optional[str]:
         """Send a plain-text WhatsApp message to ``to`` (a WhatsApp number).
@@ -62,20 +66,62 @@ class MetaMessagingService:
         message unless it returns normally.
         """
 
-        if not self._access_token:
-            raise MetaMessagingError("META_ACCESS_TOKEN is not configured.")
-        if not self._phone_number_id:
-            raise MetaMessagingError("META_PHONE_NUMBER_ID is not configured.")
-
-        self._warn_if_recipient_format_looks_wrong(to)
-
-        url = f"{self._base_url}/{self._version}/{self._phone_number_id}/messages"
         payload = {
             "messaging_product": "whatsapp",
             "to": to,
             "type": "text",
             "text": {"body": body},
         }
+        return self._send(to=to, payload=payload)
+
+    def send_driver_assignment(
+        self,
+        *,
+        to: str,
+        text_body: str,
+        template_parameters: tuple[str, ...],
+    ) -> Optional[str]:
+        """Send an assignment using a configured template, or an in-window text.
+
+        An approved utility template is required when the driver has not messaged
+        the business within the preceding 24 hours. Leaving
+        ``META_DRIVER_TEMPLATE_NAME`` unset preserves the free-form service-message
+        behavior for an already-open customer-service window.
+        """
+
+        if not self._driver_template_name:
+            return self.send_text_message(to=to, body=text_body)
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": self._driver_template_name,
+                "language": {"code": self._driver_template_language},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {"type": "text", "text": value}
+                            for value in template_parameters
+                        ],
+                    }
+                ],
+            },
+        }
+        return self._send(to=to, payload=payload)
+
+    def _send(self, *, to: str, payload: dict[str, object]) -> Optional[str]:
+        """Submit one already-built Messages API payload."""
+
+        if not self._access_token:
+            raise MetaMessagingError("META_ACCESS_TOKEN is not configured.")
+        if not self._phone_number_id:
+            raise MetaMessagingError("META_PHONE_NUMBER_ID is not configured.")
+
+        self._warn_if_recipient_format_looks_wrong(to)
+        url = f"{self._base_url}/{self._version}/{self._phone_number_id}/messages"
 
         try:
             response = self._client.post(

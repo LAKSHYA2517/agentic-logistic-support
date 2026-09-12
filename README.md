@@ -44,6 +44,8 @@ On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 | `META_ACCESS_TOKEN` | For media | Meta Graph API bearer token |
 | `META_WABA_ID` | Account setup | WABA context; never substituted for a webhook media ID |
 | `META_PHONE_NUMBER_ID` | Recommended | Sent as media lookup context |
+| `META_DRIVER_TEMPLATE_NAME` | For proactive driver messages | Approved utility-template name; omit only when the driver has an open 24-hour service window |
+| `META_DRIVER_TEMPLATE_LANGUAGE` | No | `en_US`; must match the approved template language |
 | `META_API_VERSION` | No | `v25.0` |
 | `META_GRAPH_API_BASE_URL` | No | `https://graph.facebook.com` |
 | `META_REQUEST_TIMEOUT_SECONDS` | No | `20` |
@@ -64,6 +66,20 @@ On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 | `LOG_LEVEL` | No | `INFO` |
 
 The application never logs configured access tokens, API keys, authorization headers, signed download URLs, or full webhook payloads.
+
+For proactive driver assignments, create and approve a utility template in
+WhatsApp Manager with five body variables in this order: party, truck,
+destination, advance, and balance. A suitable body is:
+
+```text
+New shipment assigned. Party: {{1}}, Truck: {{2}}, Destination: {{3}},
+Advance: {{4}}, Balance: {{5}}. Please confirm YES or NO.
+```
+
+Set its exact name and language in `META_DRIVER_TEMPLATE_NAME` and
+`META_DRIVER_TEMPLATE_LANGUAGE`. If no template is configured, the application
+sends free-form text, which Meta only delivers while that driver has an open
+24-hour customer-service window.
 
 ## Database and statuses
 

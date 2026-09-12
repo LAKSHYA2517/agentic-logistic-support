@@ -21,7 +21,7 @@ from app.services.drivers import assign_driver_for_shipment
 from app.services.messaging import MetaMessagingService
 from app.services.meta import MetaMediaService
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
-from app.services.webhook import extract_audio_messages
+from app.services.webhook import extract_audio_messages, extract_message_statuses
 
 
 @pytest.fixture
@@ -348,6 +348,63 @@ def test_irrelevant_and_malformed_payloads_are_ignored(webhook_client: tuple) ->
     assert meta_requests == []
     with session_factory() as session:
         assert session.scalar(select(func.count()).select_from(User)) == 0
+        assert session.scalar(select(func.count()).select_from(Shipment)) == 0
+
+
+def test_outbound_failed_status_is_parsed_logged_and_acknowledged(
+    webhook_client: tuple, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, session_factory, meta_requests = webhook_client
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "statuses": [
+                                {
+                                    "id": "wamid.outbound",
+                                    "status": "failed",
+                                    "recipient_id": "919317708038",
+                                    "errors": [
+                                        {
+                                            "code": 131047,
+                                            "title": "Re-engagement message",
+                                            "message": "Re-engagement message",
+                                            "error_data": {
+                                                "details": (
+                                                    "More than 24 hours have passed; "
+                                                    "use a template. See https://example.test"
+                                                )
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ],
+    }
+    caplog.set_level("INFO", logger="app")
+
+    parsed = extract_message_statuses(payload)
+    response = client.post("/meta-webhook", json=payload)
+
+    assert parsed[0].message_id == "wamid.outbound"
+    assert parsed[0].status == "failed"
+    assert parsed[0].errors[0].code == 131047
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert "meta_outbound_delivery_failed" in caplog.text
+    assert "code=131047" in caplog.text
+    assert "use a template" in caplog.text
+    assert "https://example.test" not in caplog.text
+    assert meta_requests == []
+    with session_factory() as session:
         assert session.scalar(select(func.count()).select_from(Shipment)) == 0
 
 
