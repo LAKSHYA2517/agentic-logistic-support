@@ -40,7 +40,7 @@ from app.intelligence.http_support import (
 )
 from app.intelligence.models import LogisticsExtraction
 
-GROQ_MODEL = "qwen/qwen3-32b"
+GROQ_MODEL = "qwen/qwen3.8-27b"
 PROVIDER_NAME = "groq"
 
 DEFAULT_TIMEOUT_SECONDS = 30.0

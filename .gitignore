@@ -5,6 +5,7 @@ __pycache__/
 
 .venv/
 venv/
+.venv-python39-backup
 
 .env
 *.env
