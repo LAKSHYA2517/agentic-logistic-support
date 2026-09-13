@@ -1,0 +1,230 @@
+"""Defensive parsing for Meta WhatsApp webhook envelopes."""
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+
+@dataclass(frozen=True)
+class ParsedMetaMessage:
+    """Fields needed from an incoming WhatsApp message."""
+
+    sender_number: str
+    message_id: Optional[str]
+    media_id: Optional[str]
+    message_type: str
+
+
+@dataclass(frozen=True)
+class ParsedTextMessage:
+    """Fields needed from an incoming WhatsApp text message (e.g. a driver's YES/NO)."""
+
+    sender_number: str
+    message_id: Optional[str]
+    text_body: str
+
+
+@dataclass(frozen=True)
+class ParsedPodMessage:
+    """Fields needed from an incoming POD image or document."""
+
+    sender_number: str
+    message_id: Optional[str]
+    media_id: Optional[str]
+    message_type: str
+    mime_type: Optional[str]
+
+
+@dataclass(frozen=True)
+class ParsedStatusError:
+    """Sanitized fields Meta supplies for one outbound delivery failure."""
+
+    code: Optional[int]
+    message: Optional[str]
+    details: Optional[str]
+
+
+@dataclass(frozen=True)
+class ParsedMessageStatus:
+    """Delivery state for one outbound WhatsApp message."""
+
+    message_id: str
+    status: str
+    recipient_id: Optional[str]
+    errors: tuple[ParsedStatusError, ...]
+
+
+def extract_message_statuses(payload: dict[str, Any]) -> list[ParsedMessageStatus]:
+    """Extract sent/delivered/read/failed callbacks from a Meta envelope."""
+
+    extracted: list[ParsedMessageStatus] = []
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+            for item in _dict_items(value.get("statuses")):
+                message_id = _optional_string(item.get("id"))
+                message_status = _optional_string(item.get("status"))
+                if message_id is None or message_status is None:
+                    continue
+
+                errors: list[ParsedStatusError] = []
+                for error in _dict_items(item.get("errors")):
+                    error_data = error.get("error_data")
+                    details = (
+                        _optional_string(error_data.get("details"))
+                        if isinstance(error_data, dict)
+                        else None
+                    )
+                    code = error.get("code")
+                    errors.append(
+                        ParsedStatusError(
+                            code=code if isinstance(code, int) else None,
+                            message=(
+                                _optional_string(error.get("message"))
+                                or _optional_string(error.get("title"))
+                            ),
+                            details=details,
+                        )
+                    )
+
+                extracted.append(
+                    ParsedMessageStatus(
+                        message_id=message_id,
+                        status=message_status.lower(),
+                        recipient_id=_optional_string(item.get("recipient_id")),
+                        errors=tuple(errors),
+                    )
+                )
+    return extracted
+
+
+def extract_text_messages(payload: dict[str, Any]) -> list[ParsedTextMessage]:
+    """Extract plain-text messages while tolerating missing/unexpected fields.
+
+    Mirrors ``extract_audio_messages`` -- same envelope-walking helpers,
+    just filtered to ``type == "text"`` messages with a non-empty body.
+    """
+
+    extracted: list[ParsedTextMessage] = []
+
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                if _optional_string(message.get("type")) != "text":
+                    continue
+
+                text = message.get("text")
+                body = _optional_string(text.get("body")) if isinstance(text, dict) else None
+                if body is None:
+                    continue
+
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                extracted.append(
+                    ParsedTextMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        text_body=body,
+                    )
+                )
+
+    return extracted
+
+
+def extract_pod_messages(payload: dict[str, Any]) -> list[ParsedPodMessage]:
+    """Extract image/document messages without assuming every sender is a driver."""
+
+    extracted: list[ParsedPodMessage] = []
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                message_type = _optional_string(message.get("type"))
+                if message_type not in {"image", "document"}:
+                    continue
+                media = message.get(message_type)
+                if not isinstance(media, dict):
+                    continue
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                extracted.append(
+                    ParsedPodMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        media_id=_optional_string(media.get("id")),
+                        message_type=message_type,
+                        mime_type=_optional_string(media.get("mime_type")),
+                    )
+                )
+    return extracted
+
+
+def extract_audio_messages(payload: dict[str, Any]) -> list[ParsedMetaMessage]:
+    """Extract audio messages while tolerating missing or unexpected fields."""
+
+    extracted: list[ParsedMetaMessage] = []
+
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                audio = message.get("audio")
+                message_type = _optional_string(message.get("type"))
+
+                if message_type not in {"audio", "voice"} and not isinstance(audio, dict):
+                    continue
+
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                media_id = _optional_string(audio.get("id")) if isinstance(audio, dict) else None
+                extracted.append(
+                    ParsedMetaMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        media_id=media_id,
+                        message_type=message_type or "audio",
+                    )
+                )
+
+    return extracted
+
+
+def _dict_items(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _contact_number(contacts: object) -> Optional[str]:
+    for contact in _dict_items(contacts):
+        number = _optional_string(contact.get("wa_id"))
+        if number is not None:
+            return number
+    return None
+
+
+def _optional_string(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None

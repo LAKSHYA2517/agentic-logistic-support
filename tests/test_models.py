@@ -1,0 +1,191 @@
+from collections.abc import Generator
+from pathlib import Path
+
+import pytest
+from sqlalchemy import create_engine, inspect, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.database import Base, upgrade_local_sqlite_schema
+from app.models import Driver, Shipment, ShipmentStatus, User, UserRole
+
+
+@pytest.fixture
+def db_session(tmp_path: Path) -> Generator[Session, None, None]:
+    database_path = tmp_path / "test.db"
+    test_engine = create_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(test_engine)
+
+    with Session(test_engine) as session:
+        yield session
+
+    test_engine.dispose()
+
+
+def test_create_and_query_user_with_shipment(db_session: Session) -> None:
+    raw_event = {
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "example-entry"}],
+    }
+    user = User(whatsapp_number="+919876543210", role=UserRole.OWNER)
+    shipment = Shipment(
+        user=user,
+        media_id="example-media-id",
+        raw_event=raw_event,
+    )
+    db_session.add(shipment)
+    db_session.commit()
+    db_session.expire_all()
+
+    stored_user = db_session.scalar(
+        select(User).where(User.whatsapp_number == "+919876543210")
+    )
+    stored_shipment = db_session.scalar(select(Shipment))
+
+    assert stored_user is not None
+    assert stored_shipment is not None
+    assert stored_user.shipments == [stored_shipment]
+    assert stored_shipment.user == stored_user
+    assert stored_shipment.status is ShipmentStatus.RECEIVED
+    assert stored_shipment.raw_event == raw_event
+    assert stored_shipment.media_path is None
+    assert stored_shipment.transcript is None
+    assert stored_shipment.extracted_data is None
+    assert stored_shipment.processing_error is None
+    assert stored_shipment.pod_message_id is None
+    assert stored_shipment.pod_media_path is None
+    assert stored_shipment.created_at is not None
+    assert stored_shipment.updated_at is not None
+
+
+def test_whatsapp_number_must_be_unique(db_session: Session) -> None:
+    db_session.add_all(
+        [
+            User(whatsapp_number="+919876543210", role=UserRole.OWNER),
+            User(whatsapp_number="+919876543210", role=UserRole.TRANSPORTER),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_meta_message_id_must_be_unique_when_present(db_session: Session) -> None:
+    user = User(whatsapp_number="+919999999999", role=UserRole.TRANSPORTER)
+    db_session.add_all(
+        [
+            Shipment(user=user, message_id="wamid.duplicate", raw_event={"event": 1}),
+            Shipment(user=user, message_id="wamid.duplicate", raw_event={"event": 2}),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+
+def test_sqlite_upgrade_adds_intelligence_columns_without_losing_rows(tmp_path: Path) -> None:
+    old_engine = create_engine(f"sqlite:///{tmp_path / 'old-phase1.db'}")
+    with old_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE shipments (id INTEGER PRIMARY KEY, raw_event JSON NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO shipments (id, raw_event) VALUES (1, '{\"kept\": true}')"
+        )
+
+    upgrade_local_sqlite_schema(old_engine)
+
+    columns = {item["name"] for item in inspect(old_engine).get_columns("shipments")}
+    assert {
+        "transcript",
+        "extracted_data",
+        "processing_error",
+        "processing_started_at",
+        "processing_completed_at",
+        "driver_id",
+        "driver_confirmation_status",
+        "driver_message_sent_at",
+        "driver_reply_message_id",
+        "pod_message_id",
+        "pod_media_id",
+        "pod_media_path",
+        "pod_text",
+        "pod_error",
+    } <= columns
+    with old_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT COUNT(*) FROM shipments").scalar() == 1
+
+    old_engine.dispose()
+
+
+def test_sqlite_upgrade_expands_status_constraint_without_losing_rows(
+    tmp_path: Path,
+) -> None:
+    old_engine = create_engine(f"sqlite:///{tmp_path / 'old-status.db'}")
+    with old_engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql("CREATE TABLE drivers (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql(
+            """CREATE TABLE shipments (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                status VARCHAR(12) NOT NULL,
+                raw_event JSON NOT NULL,
+                CONSTRAINT shipmentstatus CHECK (
+                    status IN ('RECEIVED', 'TRANSCRIBING', 'PARSED', 'CONFIRMED',
+                               'PROCESSING', 'COMPLETED', 'FAILED')
+                )
+            )"""
+        )
+        connection.exec_driver_sql("INSERT INTO users (id) VALUES (1)")
+        connection.exec_driver_sql(
+            "INSERT INTO shipments (id, user_id, status, raw_event) "
+            "VALUES (7, 1, 'COMPLETED', '{\"kept\": true}')"
+        )
+
+    upgrade_local_sqlite_schema(old_engine)
+
+    with old_engine.begin() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT status FROM shipments WHERE id = 7"
+        ).scalar_one() == "COMPLETED"
+        connection.exec_driver_sql(
+            "UPDATE shipments SET status = 'IN_TRANSIT' WHERE id = 7"
+        )
+        connection.exec_driver_sql(
+            "UPDATE shipments SET status = 'DELIVERED' WHERE id = 7"
+        )
+
+    old_engine.dispose()
+
+
+def test_driver_model_and_shipment_relationship(db_session: Session) -> None:
+    driver = Driver(name="Rajesh Kumar", phone="15550001111", truck_number="RJ14GB1122")
+    user = User(whatsapp_number="15559998888", role=UserRole.TRANSPORTER)
+    shipment = Shipment(
+        user=user,
+        driver=driver,
+        raw_event={"object": "whatsapp_business_account"},
+    )
+    db_session.add(shipment)
+    db_session.commit()
+    db_session.expire_all()
+
+    stored_driver = db_session.scalar(select(Driver).where(Driver.phone == "15550001111"))
+
+    assert stored_driver is not None
+    assert stored_driver.truck_number == "RJ14GB1122"
+    assert stored_driver.shipments == [shipment]
+    assert shipment.driver == stored_driver
+
+
+def test_driver_phone_and_truck_number_must_be_unique(db_session: Session) -> None:
+    db_session.add_all(
+        [
+            Driver(name="A", phone="15550001111", truck_number="RJ14GB1122"),
+            Driver(name="B", phone="15550001111", truck_number="MH12AB1234"),
+        ]
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
