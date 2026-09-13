@@ -1,30 +1,38 @@
-export function formatCurrencyINR(amount) {
-  if (amount === undefined || amount === null || isNaN(amount)) return '₹0';
-  return new Intl.NumberFormat('en-IN', {
+const LOCALES = {
+  en: 'en-IN',
+  hi: 'hi-IN',
+  ta: 'ta-IN',
+  pa: 'pa-IN',
+};
+
+export function formatCurrencyINR(amount, language = 'en') {
+  const numericAmount = Number(amount);
+  if (!Number.isFinite(numericAmount)) return '₹0';
+  return new Intl.NumberFormat(LOCALES[language] || LOCALES.en, {
     style: 'currency',
     currency: 'INR',
     maximumFractionDigits: 0,
-  }).format(amount);
+  }).format(numericAmount);
 }
 
-export function formatRelativeTime(isoString) {
-  if (!isoString) return 'Just now';
-  const date = new Date(isoString);
-  const now = new Date();
-  const diffSec = Math.floor((now - date) / 1000);
-
-  if (diffSec < 10) return 'Just now';
-  if (diffSec < 60) return `${diffSec}s ago`;
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHours = Math.floor(diffMin / 60);
-  if (diffHours < 24) return `${diffHours}h ago`;
-  return date.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+export function formatDateTime(value, language = 'en') {
+  if (!value) return '—';
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '—';
+  return new Intl.DateTimeFormat(LOCALES[language] || LOCALES.en, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
 }
 
-export function generateUUID() {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID();
+export function formatPhoneNumber(value) {
+  if (!value) return '—';
+  const digits = String(value).replace(/\D/g, '');
+  const nationalNumber = digits.length === 12 && digits.startsWith('91')
+    ? digits.slice(2)
+    : digits;
+  if (nationalNumber.length === 10) {
+    return `+91 ${nationalNumber.slice(0, 5)} ${nationalNumber.slice(5)}`;
   }
-  return 'shp-' + Math.random().toString(36).substring(2, 9) + '-' + Date.now().toString(36);
+  return String(value).startsWith('+') ? String(value) : `+${digits}`;
 }

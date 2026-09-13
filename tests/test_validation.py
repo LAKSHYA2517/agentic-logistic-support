@@ -164,6 +164,16 @@ def test_balance_due_valid_independent_of_advance():
     assert result.balance_due.status == FieldStatus.VALID
 
 
+def test_ocr_table_amounts_on_lines_after_labels_are_valid():
+    result = validate_extraction(
+        extraction(advance_paid=10000, balance_due=25000),
+        "Advanced\n₹10,000\nBalance\n₹25,000\nTotal Amount\n₹35,000",
+    )
+
+    assert result.advance_paid.status == FieldStatus.VALID
+    assert result.balance_due.status == FieldStatus.VALID
+
+
 def test_comma_immediately_after_keyword_does_not_sever_amount():
     # Regression test: "advance," must not be split from its own amount
     # just because a comma sits right after the keyword.

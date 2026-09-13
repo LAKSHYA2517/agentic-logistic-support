@@ -18,7 +18,9 @@ Meta POST /meta-webhook
             -> update the same Shipment row
 ```
 
-Document perception is also available as an independent intelligence capability using Sarvam Vision's asynchronous Document AI flow. It is not part of the voice-note webhook path.
+POD images/documents are read locally with PaddleOCR. The resulting text still
+passes through the existing extraction, deterministic validation, and shipment
+comparison gates before a shipment can become `DELIVERED`.
 
 ## Setup
 
@@ -30,6 +32,10 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 cp .env.example .env
 ```
+
+PaddleOCR downloads its English OCR model on the first POD request. Run one
+sample image before the demo while internet access is available; subsequent
+POD recognition runs locally and reuses the same in-process OCR engine.
 
 On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 
@@ -52,7 +58,7 @@ On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
 | `MEDIA_DOWNLOAD_DIR` | No | `/tmp` |
 | `MEDIA_MAX_BYTES` | No | `16777216` |
 | `INTELLIGENCE_ENABLED` | No | `true`; set `false` to demo ingestion only |
-| `SARVAM_API_KEY` | For Sarvam features | Shared Sarvam STT and Vision credential |
+| `SARVAM_API_KEY` | For voice intelligence | Sarvam STT credential; POD OCR is local |
 | `SARVAM_STT_URL` | No | Sarvam speech-to-text endpoint |
 | `GROQ_API_KEY` | For voice intelligence | Groq credential |
 | `GROQ_CHAT_COMPLETIONS_URL` | No | Groq OpenAI-compatible endpoint |
@@ -189,6 +195,6 @@ Free ngrok URLs usually change after restart, so update Meta when the forwarding
 - Only `audio/ogg` with an Ogg container header is accepted. There is no transcoding.
 - Meta POST signature verification is not yet implemented.
 - Failed jobs do not have an automatic retry endpoint.
-- Document perception accepts PDF, PNG, JPEG, and ZIP inputs. It polls Sarvam's asynchronous Document AI job in-process for at most `SARVAM_VISION_MAX_WAIT_SECONDS`; callers should move this to durable background work if document volume grows.
-- Live Sarvam Vision use requires a valid `SARVAM_API_KEY` with access to the Document AI service.
+- POD perception accepts PDF, PNG, and JPEG inputs through local PaddleOCR. The first use downloads OCR models and can be noticeably slower; later requests reuse the loaded engine.
+- PaddleOCR runs on CPU on macOS, which is appropriate for the demo but not optimized for high document volume.
 - Unit and integration tests mock all external APIs and do not require live credentials.

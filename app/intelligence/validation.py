@@ -427,7 +427,20 @@ def _contains_hedge(text: str) -> bool:
 
 def _relevant_clauses(text: str, keywords: tuple[str, ...]) -> str:
     clauses = _split_clauses(text)
-    matching = [c for c in clauses if any(kw.lower() in c.lower() for kw in keywords)]
+    matching: list[str] = []
+    for index, clause in enumerate(clauses):
+        if not any(kw.lower() in clause.lower() for kw in keywords):
+            continue
+        matching.append(clause)
+        # OCR tables commonly return a field label and its value on adjacent
+        # lines ("Advanced\n₹10,000"). Keep that amount attached to its label
+        # without pulling unrelated neighboring text into validation.
+        if (
+            not _extract_amount_candidates(clause)
+            and index + 1 < len(clauses)
+            and _extract_amount_candidates(clauses[index + 1])
+        ):
+            matching.append(clauses[index + 1])
     return " ".join(matching)
 
 

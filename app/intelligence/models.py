@@ -203,6 +203,8 @@ class ProcessingResult(BaseModel):
     transcript: str | None = None
     extraction: LogisticsExtraction | None = None
     reason: str | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+    invalid_fields: list[str] = Field(default_factory=list)
 
 
 class OCRResult(BaseModel):

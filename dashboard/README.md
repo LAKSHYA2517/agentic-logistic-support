@@ -1,16 +1,24 @@
-# React + Vite
+# Sauda Logistics Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+React and Vite operations dashboard backed by the FastAPI read-only endpoints:
 
-Currently, two official plugins are available:
+- `GET /api/shipments`
+- `GET /api/drivers`
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Start FastAPI from the repository root, then start the dashboard:
 
-## React Compiler
+```bash
+uvicorn app.main:app --reload
+cd dashboard
+npm install
+npm run dev
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Open `http://localhost:5173`. Vite proxies `/api` requests to FastAPI on port 8000.
 
-## Expanding the Oxlint configuration
+Quality checks:
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+```bash
+npm run lint
+npm run build
+```

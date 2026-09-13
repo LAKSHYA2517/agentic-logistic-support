@@ -9,6 +9,16 @@ from uuid import uuid4
 
 import httpx
 
+
+_DOCUMENT_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+}
+
+
 class MetaMediaError(RuntimeError):
     """A safe-to-store description of a Meta media retrieval failure."""
 
@@ -43,6 +53,20 @@ class MetaMediaService:
 
         media_url = self._resolve_media_url(media_id)
         return self._download_media(media_url, shipment_id)
+
+    def download_document(
+        self,
+        media_id: str,
+        shipment_id: int,
+        mime_type: Optional[str] = None,
+    ) -> Path:
+        """Resolve and safely save a Sarvam-supported POD image/document."""
+
+        if not self._access_token:
+            raise MetaMediaError("META_ACCESS_TOKEN is not configured.")
+
+        media_url = self._resolve_media_url(media_id)
+        return self._download_document(media_url, shipment_id, mime_type)
 
     def _resolve_media_url(self, media_id: str) -> str:
         lookup_url = f"{self._base_url}/{self._version}/{quote(media_id, safe='')}"
@@ -120,6 +144,70 @@ class MetaMediaService:
 
         return final_path
 
+    def _download_document(
+        self,
+        media_url: str,
+        shipment_id: int,
+        expected_mime_type: Optional[str],
+    ) -> Path:
+        partial_path = self._output_dir / f"shipment-{shipment_id}-pod-{uuid4().hex}.part"
+        final_path: Optional[Path] = None
+
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            bytes_written = 0
+            file_header = bytearray()
+            with self._client.stream(
+                "GET",
+                media_url,
+                headers=self._authorization_header,
+            ) as response:
+                if not response.is_success:
+                    raise self._http_error("download", response)
+
+                response_mime = response.headers.get("content-type", "")
+                response_mime = response_mime.split(";", maxsplit=1)[0].strip().lower()
+                requested_mime = (expected_mime_type or "").strip().lower()
+                mime_type = (
+                    response_mime
+                    if response_mime in _DOCUMENT_EXTENSIONS
+                    else requested_mime
+                )
+                extension = _DOCUMENT_EXTENSIONS.get(mime_type)
+                if extension is None:
+                    raise MetaMediaError(
+                        "Meta POD media was not a supported JPEG, PNG, PDF, or ZIP file."
+                    )
+                final_path = partial_path.with_suffix(extension)
+
+                with partial_path.open("xb") as media_file:
+                    for chunk in response.iter_bytes():
+                        if len(file_header) < 8:
+                            bytes_needed = 8 - len(file_header)
+                            file_header.extend(chunk[:bytes_needed])
+                        media_file.write(chunk)
+                        bytes_written += len(chunk)
+                        if bytes_written > self._max_media_bytes:
+                            raise MetaMediaError(
+                                "Meta POD download exceeded the configured size limit."
+                            )
+
+            if bytes_written == 0:
+                raise MetaMediaError("Meta POD download returned an empty file.")
+            if not _header_matches_extension(bytes(file_header), final_path.suffix):
+                raise MetaMediaError("Meta POD download content did not match its file type.")
+
+            partial_path.replace(final_path)
+        except MetaMediaError:
+            partial_path.unlink(missing_ok=True)
+            raise
+        except (httpx.RequestError, OSError) as exc:
+            partial_path.unlink(missing_ok=True)
+            raise MetaMediaError("Meta POD download could not be saved.") from exc
+
+        assert final_path is not None
+        return final_path
+
     @property
     def _authorization_header(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._access_token}"}
@@ -163,3 +251,13 @@ def prepare_media_directory(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir() or not os.access(output_dir, os.W_OK):
         raise RuntimeError(f"Media download directory is not writable: {output_dir}")
+
+
+def _header_matches_extension(header: bytes, extension: str) -> bool:
+    signatures = {
+        ".jpg": (b"\xff\xd8\xff",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".pdf": (b"%PDF-",),
+        ".zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+    }
+    return any(header.startswith(signature) for signature in signatures[extension])

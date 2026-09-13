@@ -99,9 +99,15 @@ def test_build_assignment_message_matches_expected_format(db_session: Session):
     message = build_assignment_message(shipment)
 
     assert message == (
-        "New shipment assigned. Party: Ramesh Traders, Truck: RJ14GB1122, "
-        "Destination: Delhi, Advance: ₹10,000, Balance: ₹25,000. "
-        "Please confirm YES or NO."
+        "Namaste Driver ji 👋\n\n"
+        "Aapko ek nayi delivery assign hui hai:\n\n"
+        "Party: Ramesh Traders\n"
+        "Truck: RJ14GB1122\n"
+        "Destination: Delhi\n"
+        "Advance: ₹10,000\n"
+        "Remaining: ₹25,000\n\n"
+        "Delivery confirm karne ke liye YES reply karein.\n"
+        "Agar koi dikkat hai to bata dijiye."
     )
 
 
@@ -119,9 +125,9 @@ def test_build_assignment_message_handles_missing_amounts(db_session: Session):
 
     message = build_assignment_message(shipment)
 
-    assert "Destination: Unknown" in message
-    assert "Advance: not stated" in message
-    assert "Balance: not stated" in message
+    assert "Destination: Nahi mila" in message
+    assert "Advance: Nahi mila" in message
+    assert "Remaining: Nahi mila" in message
 
 
 def test_build_assignment_template_parameters_match_approved_template_order(
@@ -169,7 +175,7 @@ def test_assign_driver_for_shipment_happy_path(db_session: Session):
 
     assert assignment is not None
     assert assignment.driver.id == driver.id
-    assert "Please confirm YES or NO." in assignment.message
+    assert "Delivery confirm karne ke liye YES reply karein." in assignment.message
 
     db_session.refresh(shipment)
     assert shipment.driver_id == driver.id

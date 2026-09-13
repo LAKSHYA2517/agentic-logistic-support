@@ -1,16 +1,7 @@
-"""Read-only shipment feed for the operations dashboard.
+"""Read-only shipment and driver feeds for the operations dashboard.
 
-The dashboard (``ansh`` branch, copied into ``dashboard/``) was built
-against a mocked WebSocket payload shape:
-``{id, party_name, truck_number, origin, destination, advance_paid,
-balance_due, status, updated_at, source_voice_note}`` with ``status``
-one of ``PENDING_LOADING | IN_TRANSIT | DELAYED | DELIVERED |
-PAYMENT_PENDING`` (see ``dashboard/src/utils/constants.js``).
-
-This module is the one place that bridges that shape to the real
-``Shipment``/``Driver`` rows: it never mutates anything, and it does
-not change what the seller/driver WhatsApp workflow does -- it only
-reads and reshapes state that workflow already produces.
+This module only reshapes existing ``Shipment`` and ``Driver`` rows for
+the UI. It never mutates the WhatsApp workflow or invents dashboard data.
 """
 
 from __future__ import annotations
@@ -18,11 +9,11 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
-from app.models import DriverConfirmationStatus, Shipment, ShipmentStatus
+from app.models import Driver, DriverConfirmationStatus, Shipment, ShipmentStatus
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
@@ -36,9 +27,48 @@ def list_shipments(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
     """Return every shipment in the shape the dashboard expects."""
 
     shipments = db.scalars(
-        select(Shipment).order_by(Shipment.updated_at.desc()).limit(_MAX_SHIPMENTS_RETURNED)
+        select(Shipment)
+        .options(selectinload(Shipment.driver))
+        .order_by(Shipment.updated_at.desc())
+        .limit(_MAX_SHIPMENTS_RETURNED)
     ).all()
     return [_serialize(shipment) for shipment in shipments]
+
+
+@router.get("/drivers")
+def list_drivers(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    """Return every registered driver and their current assignment, if any."""
+
+    drivers = db.scalars(select(Driver).order_by(Driver.name, Driver.id)).all()
+    active_shipments = db.scalars(
+        select(Shipment)
+        .where(
+            Shipment.driver_id.is_not(None),
+            or_(
+                Shipment.status == ShipmentStatus.IN_TRANSIT,
+                and_(
+                    Shipment.status == ShipmentStatus.COMPLETED,
+                    Shipment.driver_confirmation_status.in_(
+                        (
+                            DriverConfirmationStatus.PENDING,
+                            DriverConfirmationStatus.CONFIRMED,
+                        )
+                    ),
+                ),
+            ),
+        )
+        .order_by(Shipment.updated_at.desc(), Shipment.id.desc())
+    ).all()
+
+    current_by_driver: dict[int, Shipment] = {}
+    for shipment in active_shipments:
+        if shipment.driver_id is not None:
+            current_by_driver.setdefault(shipment.driver_id, shipment)
+
+    return [
+        _serialize_driver(driver, current_by_driver.get(driver.id))
+        for driver in drivers
+    ]
 
 
 def _serialize(shipment: Shipment) -> dict[str, Any]:
@@ -48,7 +78,7 @@ def _serialize(shipment: Shipment) -> dict[str, Any]:
     return {
         "id": f"SHP-{shipment.id}",
         "party_name": extracted.get("party_name"),
-        "truck_number": extracted.get("truck_number"),
+        "truck_number": extracted.get("truck_number") or (driver.truck_number if driver else None),
         "origin": None,  # not captured by the voice extraction pipeline
         "destination": extracted.get("destination"),
         "advance_paid": extracted.get("advance_paid") or 0,
@@ -56,8 +86,6 @@ def _serialize(shipment: Shipment) -> dict[str, Any]:
         "status": _dashboard_status(shipment),
         "updated_at": (shipment.updated_at or shipment.created_at).isoformat(),
         "source_voice_note": shipment.transcript,
-        # Extra fields the current dashboard UI doesn't render yet, kept
-        # available for future components without another backend change.
         "driver_name": driver.name if driver else None,
         "driver_phone": driver.phone if driver else None,
         "driver_confirmation_status": (
@@ -68,33 +96,42 @@ def _serialize(shipment: Shipment) -> dict[str, Any]:
     }
 
 
-def _dashboard_status(shipment: Shipment) -> str:
-    """Map the real (Shipment status, driver confirmation) pair to one dashboard status.
+def _serialize_driver(driver: Driver, shipment: Optional[Shipment]) -> dict[str, Any]:
+    extracted = shipment.extracted_data or {} if shipment else {}
+    return {
+        "id": driver.id,
+        "name": driver.name,
+        "phone": driver.phone,
+        "truck_number": driver.truck_number,
+        "availability": "OCCUPIED" if shipment else "FREE",
+        "current_shipment_id": f"SHP-{shipment.id}" if shipment else None,
+        "current_status": _dashboard_status(shipment) if shipment else None,
+        "destination": extracted.get("destination"),
+        "party_name": extracted.get("party_name"),
+    }
 
-    The dashboard's lifecycle has no separate "driver acceptance" axis --
-    it folds everything into a single status badge -- so a driver's
-    WhatsApp YES/NO reply has to show up as a *status change*, not a new
-    field: CONFIRMED promotes an accepted shipment to "in transit";
-    REJECTED (or an intelligence failure) surfaces as "delayed" so it's
-    visibly flagged for attention.
-    """
+
+def _dashboard_status(shipment: Shipment) -> str:
+    """Map backend lifecycle fields to one clear operations status."""
+
+    if shipment.status is ShipmentStatus.DELIVERED:
+        return "DELIVERED"
+
+    if shipment.status is ShipmentStatus.IN_TRANSIT:
+        return "IN_TRANSIT"
 
     if shipment.status in (ShipmentStatus.FAILED, ShipmentStatus.PARSED):
-        # PARSED means Phase 2 flagged the extraction for human review
-        # (NEEDS_REVIEW) -- that is an exception state, not a routine
-        # "still loading" one.
-        return "DELAYED"
+        return "NEEDS_REVIEW"
 
     if shipment.status is ShipmentStatus.COMPLETED:
         confirmation: Optional[DriverConfirmationStatus] = shipment.driver_confirmation_status
         if confirmation is DriverConfirmationStatus.CONFIRMED:
             return "IN_TRANSIT"
         if confirmation is DriverConfirmationStatus.REJECTED:
-            return "DELAYED"
-        # ACCEPTED by intelligence, but no driver confirmation yet
-        # (still PENDING, or no driver could be matched at all).
-        return "PENDING_LOADING"
+            return "NEEDS_REVIEW"
+        if confirmation is DriverConfirmationStatus.PENDING and shipment.driver_id is not None:
+            return "ASSIGNED"
+        return "NEEDS_REVIEW"
 
-    # RECEIVED / TRANSCRIBING / PROCESSING / CONFIRMED: still on the way
-    # to a first result.
-    return "PENDING_LOADING"
+    # RECEIVED / TRANSCRIBING / PROCESSING / CONFIRMED are not yet assigned.
+    return "PROCESSING"

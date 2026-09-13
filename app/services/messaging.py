@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
+
+if TYPE_CHECKING:
+    from app.config import AppSettings
 
 logger = logging.getLogger(__name__)
 
@@ -246,3 +249,17 @@ class MetaMessagingService:
             return MetaMessagingError(f"{base_message}.")
 
         return MetaMessagingError(f"{base_message}: {self._redact(raw_message)}")
+
+
+def send_whatsapp_text(settings: AppSettings, *, to: str, body: str) -> Optional[str]:
+    """Send one workflow text with the application's existing Meta configuration."""
+
+    with httpx.Client(timeout=settings.meta_request_timeout_seconds) as http_client:
+        service = MetaMessagingService(
+            access_token=settings.meta_access_token,
+            graph_api_base_url=settings.meta_graph_api_base_url,
+            graph_api_version=settings.meta_api_version,
+            phone_number_id=settings.meta_phone_number_id,
+            http_client=http_client,
+        )
+        return service.send_text_message(to=to, body=body)

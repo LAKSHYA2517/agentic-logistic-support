@@ -8,12 +8,12 @@ external I/O, so there's no need to background it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Driver, DriverConfirmationStatus, Shipment
+from app.models import Driver, DriverConfirmationStatus, Shipment, ShipmentStatus
 from app.services.webhook import ParsedTextMessage
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ class DriverReplyResult:
     ignored_no_driver: int = 0
     ignored_no_active_shipment: int = 0
     ignored_unrecognized: int = 0
+    confirmed_shipment_ids: list[int] = field(default_factory=list)
 
     @property
     def processed(self) -> int:
@@ -95,6 +96,8 @@ def _process_one_reply(db: Session, message: ParsedTextMessage, result: DriverRe
 
     shipment.driver_confirmation_status = new_status
     shipment.driver_reply_message_id = message.message_id
+    if new_status is DriverConfirmationStatus.CONFIRMED:
+        shipment.status = ShipmentStatus.IN_TRANSIT
     try:
         db.commit()
     except Exception:
@@ -109,5 +112,6 @@ def _process_one_reply(db: Session, message: ParsedTextMessage, result: DriverRe
     )
     if new_status is DriverConfirmationStatus.CONFIRMED:
         result.confirmed += 1
+        result.confirmed_shipment_ids.append(shipment.id)
     else:
         result.rejected += 1

@@ -142,6 +142,13 @@ async def test_validation_failure_fabricated_field_returns_failed(audio_file):
     assert result.status == ProcessingStatus.FAILED
     assert result.extraction is None
     assert result.reason is not None
+    assert result.invalid_fields == ["party_name"]
+    assert result.missing_fields == [
+        "truck_number",
+        "destination",
+        "advance_paid",
+        "balance_due",
+    ]
 
 
 # ---------------------------------------------------------------------------

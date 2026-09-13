@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.intelligence.validation import normalize_truck_number
 from app.models import Driver, DriverConfirmationStatus, Shipment
+from app.services.workflow_messages import driver_assignment_message
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class DriverAssignment:
     """A driver newly assigned to a shipment, with the message to send them."""
 
     driver: Driver
+    owner_phone: str
     message: str
     template_parameters: tuple[str, ...]
 
@@ -49,18 +51,20 @@ def find_driver_by_truck_number(db: Session, truck_number: str) -> Optional[Driv
     return db.scalar(select(Driver).where(Driver.truck_number == canonical))
 
 
-def build_assignment_message(shipment: Shipment) -> str:
+def build_assignment_message(shipment: Shipment, driver_name: str | None = None) -> str:
     """Compose the outbound confirmation-request message for a driver."""
 
     data = shipment.extracted_data or {}
-    party = data.get("party_name") or "Unknown party"
-    truck = data.get("truck_number") or "Unknown"
-    destination = data.get("destination") or "Unknown"
-
-    return (
-        f"New shipment assigned. Party: {party}, Truck: {truck}, "
-        f"Destination: {destination}, Advance: {_format_currency(data.get('advance_paid'))}, "
-        f"Balance: {_format_currency(data.get('balance_due'))}. Please confirm YES or NO."
+    resolved_driver_name = driver_name or (
+        shipment.driver.name if shipment.driver is not None else "Driver"
+    )
+    return driver_assignment_message(
+        driver_name=resolved_driver_name,
+        party=data.get("party_name"),
+        truck=data.get("truck_number"),
+        destination=data.get("destination"),
+        advance=data.get("advance_paid"),
+        balance=data.get("balance_due"),
     )
 
 
@@ -132,7 +136,7 @@ def assign_driver_for_shipment(db: Session, shipment_id: int) -> Optional[Driver
         )
         return None
 
-    message = build_assignment_message(shipment)
+    message = build_assignment_message(shipment, driver.name)
 
     shipment.driver_id = driver.id
     shipment.driver_confirmation_status = DriverConfirmationStatus.PENDING
@@ -151,6 +155,7 @@ def assign_driver_for_shipment(db: Session, shipment_id: int) -> Optional[Driver
     )
     return DriverAssignment(
         driver=driver,
+        owner_phone=shipment.user.whatsapp_number,
         message=message,
         template_parameters=build_assignment_template_parameters(shipment),
     )

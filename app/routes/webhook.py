@@ -15,11 +15,13 @@ from app.intelligence.http_support import sanitize_provider_message
 from app.schemas import WebhookResponse
 from app.services.driver_replies import process_driver_replies
 from app.services.processing import ShipmentTaskRunner, get_shipment_task_runner
+from app.services.pod import claim_pod_messages
 from app.services.shipments import persist_audio_messages
 from app.services.webhook import (
     ParsedMessageStatus,
     extract_audio_messages,
     extract_message_statuses,
+    extract_pod_messages,
     extract_text_messages,
 )
 
@@ -82,15 +84,16 @@ async def receive_meta_webhook(
     audio_messages = extract_audio_messages(payload)
     text_messages = extract_text_messages(payload)
     message_statuses = extract_message_statuses(payload)
+    pod_messages = extract_pod_messages(payload)
 
     for message_status in message_statuses:
         _log_message_status(message_status)
 
-    if not audio_messages and not text_messages and not message_statuses:
+    if not audio_messages and not text_messages and not message_statuses and not pod_messages:
         logger.info("webhook_ignored reason=no_recognized_messages")
         return WebhookResponse(status="ignored")
 
-    if message_statuses and not audio_messages and not text_messages:
+    if message_statuses and not audio_messages and not text_messages and not pod_messages:
         return WebhookResponse(status="accepted")
 
     driver_confirmed = 0
@@ -107,6 +110,28 @@ async def receive_meta_webhook(
             ) from exc
         driver_confirmed = reply_result.confirmed
         driver_rejected = reply_result.rejected
+        for shipment_id in reply_result.confirmed_shipment_ids:
+            background_tasks.add_task(task_runner.notify_driver_confirmation, shipment_id)
+
+    if pod_messages:
+        for message in pod_messages:
+            logger.info(
+                "pod_message_identified message_id=%s media_id=%s sender=%s",
+                message.message_id,
+                message.media_id,
+                message.sender_number,
+            )
+        try:
+            pod_result = claim_pod_messages(db, pod_messages)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error("pod_database_error error_type=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="POD persistence failed.",
+            ) from exc
+        for shipment_id in pod_result.queued_shipment_ids:
+            background_tasks.add_task(task_runner.process_pod, shipment_id)
 
     if not audio_messages:
         return WebhookResponse(

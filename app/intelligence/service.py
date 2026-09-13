@@ -37,6 +37,7 @@ from app.intelligence.extraction import extract_logistics_data
 from app.intelligence.media_validator import validate_media
 from app.intelligence.http_support import sanitize_provider_message
 from app.intelligence.models import (
+    FieldStatus,
     LogisticsExtraction,
     MediaMetadata,
     NormalizedTranscript,
@@ -109,8 +110,15 @@ def _result_from_decision(
     decision: ProcessingDecision,
     transcript: str,
 ) -> ProcessingResult:
+    missing_fields, invalid_fields = _field_issues(decision)
     if decision.status == ProcessingStatus.FAILED:
-        return _failed_result(shipment_id, decision.reason, transcript)
+        result = _failed_result(shipment_id, decision.reason, transcript)
+        return result.model_copy(
+            update={
+                "missing_fields": missing_fields,
+                "invalid_fields": invalid_fields,
+            }
+        )
 
     return ProcessingResult(
         shipment_id=shipment_id,
@@ -118,7 +126,32 @@ def _result_from_decision(
         transcript=transcript,
         extraction=decision.extraction,
         reason=None if decision.status == ProcessingStatus.ACCEPTED else decision.reason,
+        missing_fields=missing_fields,
+        invalid_fields=invalid_fields,
     )
+
+
+def _field_issues(decision: ProcessingDecision) -> tuple[list[str], list[str]]:
+    """Preserve field categories for feedback without preserving untrusted values."""
+
+    if decision.validation is None:
+        return [], []
+
+    missing: list[str] = []
+    invalid: list[str] = []
+    for field_name in (
+        "party_name",
+        "truck_number",
+        "destination",
+        "advance_paid",
+        "balance_due",
+    ):
+        field_result = getattr(decision.validation, field_name)
+        if field_result.status is FieldStatus.NOT_STATED:
+            missing.append(field_name)
+        elif field_result.status in (FieldStatus.INVALID, FieldStatus.NEEDS_REVIEW):
+            invalid.append(field_name)
+    return missing, invalid
 
 
 async def run_audio_pipeline(

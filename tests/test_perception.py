@@ -1,7 +1,8 @@
 import pytest
 
+import app.intelligence.perception as perception
 from app.intelligence.models import OCRResult
-from app.intelligence.ocr import PROVIDER_NAME
+from app.intelligence.ocr import PADDLE_PROVIDER_NAME, PROVIDER_NAME
 from app.intelligence.perception import extract_document_text
 
 
@@ -66,3 +67,18 @@ async def test_failed_sarvam_result_preserves_error_and_is_annotated_failed(imag
 
     assert result.success is False
     assert result.metadata == {"error": "vision outage", "quality": "FAILED"}
+
+
+async def test_default_document_reader_uses_local_paddle_ocr(image_file, monkeypatch):
+    provider_result = OCRResult(
+        text="Vehicle RJ14GB1122 Destination Delhi",
+        provider=PADDLE_PROVIDER_NAME,
+        success=True,
+    )
+    fake = make_fake_vision(provider_result)
+    monkeypatch.setattr(perception, "PaddleOcrProvider", lambda: fake)
+
+    result = await extract_document_text(image_file)
+
+    assert result.provider == PADDLE_PROVIDER_NAME
+    assert result.metadata["quality"] == "GOOD"

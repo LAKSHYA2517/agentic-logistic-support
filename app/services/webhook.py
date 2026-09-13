@@ -24,6 +24,17 @@ class ParsedTextMessage:
 
 
 @dataclass(frozen=True)
+class ParsedPodMessage:
+    """Fields needed from an incoming POD image or document."""
+
+    sender_number: str
+    message_id: Optional[str]
+    media_id: Optional[str]
+    message_type: str
+    mime_type: Optional[str]
+
+
+@dataclass(frozen=True)
 class ParsedStatusError:
     """Sanitized fields Meta supplies for one outbound delivery failure."""
 
@@ -125,6 +136,40 @@ def extract_text_messages(payload: dict[str, Any]) -> list[ParsedTextMessage]:
                     )
                 )
 
+    return extracted
+
+
+def extract_pod_messages(payload: dict[str, Any]) -> list[ParsedPodMessage]:
+    """Extract image/document messages without assuming every sender is a driver."""
+
+    extracted: list[ParsedPodMessage] = []
+    for entry in _dict_items(payload.get("entry")):
+        for change in _dict_items(entry.get("changes")):
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            fallback_sender = _contact_number(value.get("contacts"))
+            for message in _dict_items(value.get("messages")):
+                message_type = _optional_string(message.get("type"))
+                if message_type not in {"image", "document"}:
+                    continue
+                media = message.get(message_type)
+                if not isinstance(media, dict):
+                    continue
+                sender_number = _optional_string(message.get("from")) or fallback_sender
+                if sender_number is None:
+                    continue
+
+                extracted.append(
+                    ParsedPodMessage(
+                        sender_number=sender_number,
+                        message_id=_optional_string(message.get("id")),
+                        media_id=_optional_string(media.get("id")),
+                        message_type=message_type,
+                        mime_type=_optional_string(media.get("mime_type")),
+                    )
+                )
     return extracted
 
 

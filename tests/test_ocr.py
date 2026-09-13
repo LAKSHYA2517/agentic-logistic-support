@@ -5,7 +5,9 @@ import pytest
 from app.intelligence.exceptions import OcrConfigurationError
 from app.intelligence.models import OCRQuality, OCRResult
 from app.intelligence.ocr import (
+    PADDLE_PROVIDER_NAME,
     PROVIDER_NAME,
+    PaddleOcrProvider,
     SarvamVisionProvider,
     evaluate_ocr_quality,
 )
@@ -71,6 +73,61 @@ def make_provider(doc_ai: FakeDocAI, **kwargs) -> SarvamVisionProvider:
         max_wait_seconds=1,
         **kwargs,
     )
+
+
+class FakePaddleEngine:
+    def __init__(self, pages=None, error: Exception | None = None):
+        self.pages = pages if pages is not None else []
+        self.error = error
+        self.inputs: list[str] = []
+
+    def predict(self, file_path: str):
+        self.inputs.append(file_path)
+        if self.error is not None:
+            raise self.error
+        return self.pages
+
+
+async def test_paddle_ocr_extracts_lines_and_average_confidence(image_file):
+    engine = FakePaddleEngine(
+        pages=[
+            {
+                "res": {
+                    "rec_texts": ["Vehicle No. RJ14GB1122", "Destination Delhi"],
+                    "rec_scores": [0.98, 0.94],
+                }
+            }
+        ]
+    )
+
+    result = await PaddleOcrProvider(engine=engine).extract_text(image_file)
+
+    assert result.text == "Vehicle No. RJ14GB1122\nDestination Delhi"
+    assert result.provider == PADDLE_PROVIDER_NAME
+    assert result.confidence == pytest.approx(0.96)
+    assert result.success is True
+    assert result.metadata == {"pages": 1, "lines": 2}
+    assert engine.inputs == [image_file]
+
+
+async def test_paddle_ocr_empty_output_is_a_safe_failure(image_file):
+    result = await PaddleOcrProvider(engine=FakePaddleEngine()).extract_text(image_file)
+
+    assert result.success is False
+    assert result.provider == PADDLE_PROVIDER_NAME
+    assert "no document text" in result.metadata["error"]
+
+
+async def test_paddle_ocr_error_is_sanitized(image_file):
+    result = await PaddleOcrProvider(
+        engine=FakePaddleEngine(
+            error=RuntimeError("failed at https://private.example/pod with Bearer secret")
+        )
+    ).extract_text(image_file)
+
+    assert result.success is False
+    assert "https://" not in result.metadata["error"]
+    assert "Bearer secret" not in result.metadata["error"]
 
 
 async def test_successful_extraction_and_request_shape(image_file):

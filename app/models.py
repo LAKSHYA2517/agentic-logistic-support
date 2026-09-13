@@ -28,6 +28,8 @@ class ShipmentStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
+    IN_TRANSIT = "IN_TRANSIT"
+    DELIVERED = "DELIVERED"
     FAILED = "FAILED"
 
 
@@ -147,6 +149,15 @@ class Shipment(Base):
     driver_reply_message_id: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, unique=True, index=True
     )
+    pod_message_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, unique=True, index=True
+    )
+    pod_media_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    pod_media_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    pod_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pod_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

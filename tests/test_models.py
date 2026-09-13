@@ -52,6 +52,8 @@ def test_create_and_query_user_with_shipment(db_session: Session) -> None:
     assert stored_shipment.transcript is None
     assert stored_shipment.extracted_data is None
     assert stored_shipment.processing_error is None
+    assert stored_shipment.pod_message_id is None
+    assert stored_shipment.pod_media_path is None
     assert stored_shipment.created_at is not None
     assert stored_shipment.updated_at is not None
 
@@ -104,9 +106,55 @@ def test_sqlite_upgrade_adds_intelligence_columns_without_losing_rows(tmp_path: 
         "driver_confirmation_status",
         "driver_message_sent_at",
         "driver_reply_message_id",
+        "pod_message_id",
+        "pod_media_id",
+        "pod_media_path",
+        "pod_text",
+        "pod_error",
     } <= columns
     with old_engine.connect() as connection:
         assert connection.exec_driver_sql("SELECT COUNT(*) FROM shipments").scalar() == 1
+
+    old_engine.dispose()
+
+
+def test_sqlite_upgrade_expands_status_constraint_without_losing_rows(
+    tmp_path: Path,
+) -> None:
+    old_engine = create_engine(f"sqlite:///{tmp_path / 'old-status.db'}")
+    with old_engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql("CREATE TABLE drivers (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql(
+            """CREATE TABLE shipments (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                status VARCHAR(12) NOT NULL,
+                raw_event JSON NOT NULL,
+                CONSTRAINT shipmentstatus CHECK (
+                    status IN ('RECEIVED', 'TRANSCRIBING', 'PARSED', 'CONFIRMED',
+                               'PROCESSING', 'COMPLETED', 'FAILED')
+                )
+            )"""
+        )
+        connection.exec_driver_sql("INSERT INTO users (id) VALUES (1)")
+        connection.exec_driver_sql(
+            "INSERT INTO shipments (id, user_id, status, raw_event) "
+            "VALUES (7, 1, 'COMPLETED', '{\"kept\": true}')"
+        )
+
+    upgrade_local_sqlite_schema(old_engine)
+
+    with old_engine.begin() as connection:
+        assert connection.exec_driver_sql(
+            "SELECT status FROM shipments WHERE id = 7"
+        ).scalar_one() == "COMPLETED"
+        connection.exec_driver_sql(
+            "UPDATE shipments SET status = 'IN_TRANSIT' WHERE id = 7"
+        )
+        connection.exec_driver_sql(
+            "UPDATE shipments SET status = 'DELIVERED' WHERE id = 7"
+        )
 
     old_engine.dispose()
 

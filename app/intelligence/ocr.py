@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
+from numbers import Real
 from pathlib import Path
 from time import monotonic
 from typing import Any, Protocol
@@ -17,6 +19,7 @@ from app.intelligence.models import OCRQuality, OCRResult
 
 
 PROVIDER_NAME = "sarvam_vision"
+PADDLE_PROVIDER_NAME = "paddleocr"
 MODEL_NAME = "sarvam-vision"
 TERMINAL_STATUSES = frozenset(
     {"completed", "partially_completed", "failed", "rejected"}
@@ -81,6 +84,97 @@ def evaluate_ocr_quality(result: OCRResult) -> OCRQuality:
     if meaningful_count < _MIN_MEANINGFUL_CHARS or ratio < _MIN_MEANINGFUL_RATIO:
         return OCRQuality.POOR
     return OCRQuality.GOOD
+
+
+_paddle_engine: Any | None = None
+_paddle_lock = threading.Lock()
+
+
+class PaddleOcrProvider:
+    """Read POD images locally with one lazily initialized PaddleOCR engine."""
+
+    def __init__(self, *, engine: Any | None = None) -> None:
+        self._engine = engine
+        self._lock = threading.Lock() if engine is not None else _paddle_lock
+
+    async def extract_text(self, file_path: str) -> OCRResult:
+        path = Path(file_path)
+        if not path.is_file():
+            return self._failure("POD file was not found")
+        if path.suffix.lower() not in SUPPORTED_MEDIA_TYPES:
+            return self._failure("unsupported POD type; expected PDF, PNG, or JPEG")
+
+        try:
+            return await asyncio.to_thread(self._extract_sync, path)
+        except Exception as exc:
+            detail = sanitize_provider_message(str(exc)) or type(exc).__name__
+            return self._failure(f"PaddleOCR failed: {detail}")
+
+    def _extract_sync(self, path: Path) -> OCRResult:
+        with self._lock:
+            engine = self._engine or _get_paddle_engine()
+            pages = list(engine.predict(str(path)))
+
+        texts: list[str] = []
+        scores: list[float] = []
+        for page in pages:
+            page_data = _paddle_page_data(page)
+            for text in page_data.get("rec_texts") or []:
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+            for score in page_data.get("rec_scores") or []:
+                if isinstance(score, Real) and not isinstance(score, bool):
+                    scores.append(float(score))
+
+        if not texts:
+            return self._failure("PaddleOCR returned no document text")
+        confidence = sum(scores) / len(scores) if scores else None
+        return OCRResult(
+            text="\n".join(texts),
+            provider=PADDLE_PROVIDER_NAME,
+            confidence=confidence,
+            success=True,
+            metadata={"pages": len(pages), "lines": len(texts)},
+        )
+
+    @staticmethod
+    def _failure(message: str) -> OCRResult:
+        return OCRResult(
+            text="",
+            provider=PADDLE_PROVIDER_NAME,
+            confidence=None,
+            success=False,
+            metadata={"error": message},
+        )
+
+
+def _get_paddle_engine() -> Any:
+    global _paddle_engine
+    if _paddle_engine is None:
+        from paddleocr import PaddleOCR
+
+        _paddle_engine = PaddleOCR(
+            lang="en",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            engine="paddle",
+        )
+    return _paddle_engine
+
+
+def _paddle_page_data(page: Any) -> dict[str, Any]:
+    if isinstance(page, dict):
+        return page.get("res", page)
+    try:
+        data = page.json
+    except (AttributeError, TypeError):
+        return {}
+    if callable(data):
+        data = data()
+    if not isinstance(data, dict):
+        return {}
+    return data.get("res", data)
 
 
 class SarvamVisionProvider:

@@ -133,10 +133,15 @@ def webhook_client(
         meta_webhook_verify_token="demo-verify-token",
         intelligence_enabled=False,
     )
+
+    async def ignore_confirmation_notifications(_: int) -> None:
+        return None
+
     app.dependency_overrides[get_shipment_task_runner] = lambda: ShipmentTaskRunner(
         settings=test_settings,
         session_factory=testing_session_factory,
         media_downloader=media_service.download_audio,
+        confirmation_notifier=ignore_confirmation_notifications,
     )
     app.dependency_overrides[get_settings] = lambda: test_settings
     with TestClient(app) as client:
@@ -840,9 +845,15 @@ def test_full_flow_seller_voice_to_driver_assignment_and_whatsapp_message(
     assert sent_body["to"] == "15550009999"
     assert sent_body["type"] == "text"
     assert sent_body["text"]["body"] == (
-        "New shipment assigned. Party: Ramesh Traders, Truck: RJ14GB1122, "
-        "Destination: Delhi, Advance: ₹10,000, Balance: ₹25,000. "
-        "Please confirm YES or NO."
+        "Namaste Rajesh Kumar ji 👋\n\n"
+        "Aapko ek nayi delivery assign hui hai:\n\n"
+        "Party: Ramesh Traders\n"
+        "Truck: RJ14GB1122\n"
+        "Destination: Delhi\n"
+        "Advance: ₹10,000\n"
+        "Remaining: ₹25,000\n\n"
+        "Delivery confirm karne ke liye YES reply karein.\n"
+        "Agar koi dikkat hai to bata dijiye."
     )
 
 
@@ -876,11 +887,22 @@ def test_truck_not_found_is_graceful_no_driver_assigned_no_message_sent(
 
     async def fake_stt(file_path: str) -> STTResult:
         return STTResult(
-            transcript="truck MH12AB1234 advance das hazaar", provider="fake", model="fake"
+            transcript=(
+                "Ramesh Traders truck MH12AB1234 Delhi advance das hazaar and "
+                "balance pachees hazaar"
+            ),
+            provider="fake",
+            model="fake",
         )
 
     async def fake_extractor(_: str) -> LogisticsExtraction:
-        return LogisticsExtraction(truck_number="MH12AB1234", advance_paid=10000)
+        return LogisticsExtraction(
+            party_name="Ramesh Traders",
+            truck_number="MH12AB1234",
+            destination="Delhi",
+            advance_paid=10000,
+            balance_due=25000,
+        )
 
     async def intelligence_processor(shipment_id: int):
         return await process_audio(
@@ -958,11 +980,22 @@ def test_duplicate_audio_webhook_sends_driver_message_only_once(
 
     async def fake_stt(file_path: str) -> STTResult:
         return STTResult(
-            transcript="truck RJ14GB1122 advance das hazaar", provider="fake", model="fake"
+            transcript=(
+                "Ramesh Traders truck RJ14GB1122 Delhi advance das hazaar and "
+                "balance pachees hazaar"
+            ),
+            provider="fake",
+            model="fake",
         )
 
     async def fake_extractor(_: str) -> LogisticsExtraction:
-        return LogisticsExtraction(truck_number="RJ14GB1122", advance_paid=10000)
+        return LogisticsExtraction(
+            party_name="Ramesh Traders",
+            truck_number="RJ14GB1122",
+            destination="Delhi",
+            advance_paid=10000,
+            balance_due=25000,
+        )
 
     async def intelligence_processor(shipment_id: int):
         return await process_audio(
@@ -1049,6 +1082,7 @@ def test_driver_reply_yes_confirms_shipment(webhook_client: tuple) -> None:
     with session_factory() as session:
         shipment = session.get(Shipment, shipment_id)
         assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED
+        assert shipment.status is ShipmentStatus.IN_TRANSIT
         assert shipment.driver_reply_message_id == "wamid.yes-reply"
 
 
@@ -1067,6 +1101,7 @@ def test_driver_reply_confirm_lowercase_confirms_shipment(webhook_client: tuple)
     with session_factory() as session:
         shipment = session.get(Shipment, shipment_id)
         assert shipment.driver_confirmation_status is DriverConfirmationStatus.CONFIRMED
+        assert shipment.status is ShipmentStatus.IN_TRANSIT
 
 
 def test_driver_reply_no_rejects_shipment(webhook_client: tuple) -> None:
